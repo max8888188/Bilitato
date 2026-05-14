@@ -60,8 +60,7 @@ const MAX_SUBTITLE_CHARS = 36000;
 const GROQ_AUDIO_TRANSCRIBE_URL = "https://api.groq.com/openai/v1/audio/transcriptions";
 const GROQ_MAX_AUDIO_BYTES = 24 * 1024 * 1024;
 const SUPABASE_DEFAULT_VIDEO_CACHE_TABLE = "video_cache";
-const SUPABASE_DEFAULT_USAGE_RPC = "increment_feature_usage_with_token_log";
-const SUPABASE_DEFAULT_USAGE_STATS_TABLE = "usage_stats";
+const SUPABASE_DEFAULT_USAGE_DAILY_RPC = "increment_feature_usage_daily";
 const DEFAULT_SENTRY_DSN = "https://04879b2bd5fc72eba741a402e26c4790@o4511384082055168.ingest.de.sentry.io/4511384299634768";
 const TASK_KEYS = ["summary", "segments", "rumors"];
 const CLOUD_CACHE_KEYS = ["subtitle", ...TASK_KEYS];
@@ -81,8 +80,7 @@ const DEFAULT_SETTINGS = {
     supabaseUrl: "https://qdksdauixnbgrgkilgac.supabase.co",
     supabaseAnonKey: "sb_publishable_55zwbZc_sQ0k4EDJBgpxsQ_1F86l1vT",
     supabaseVideoCacheTable: SUPABASE_DEFAULT_VIDEO_CACHE_TABLE,
-    supabaseUsageRpcName: SUPABASE_DEFAULT_USAGE_RPC,
-    supabaseUsageStatsTable: SUPABASE_DEFAULT_USAGE_STATS_TABLE,
+    supabaseUsageDailyRpcName: SUPABASE_DEFAULT_USAGE_DAILY_RPC,
     prefMode: "efficiency",
     debugMode: false,
     sentryEnabled: true,
@@ -278,6 +276,8 @@ async function handleMessage(msg, sender) {
         const { url, filename } = msg.payload || {};
         const tabId = msg.tabId || sender.tab?.id;
         if (!url) throw new Error("URL is required");
+        const settings = await getResolvedSettings();
+        const startedAt = Date.now();
         const urlMeta = getUrlMeta(url);
         const fileExt = getFileExtension(filename || "download.mp4");
         logDownload.info("download_chrome_api_start", {
@@ -315,6 +315,10 @@ async function handleMessage(msg, sender) {
             return { success: true, downloadId };
 
         } catch (error) {
+            await reportDailyFeatureUsage("download", settings, {
+                durationMs: Date.now() - startedAt,
+                tokens: 0
+            }, resolveUsageStatusByError(error), resolveUsageErrorCode(error, "DOWNLOAD_CHROME_API_FAILED"));
             logDownload.error("download_chrome_api_failed", {
                 task: "download",
                 source: "background",
@@ -768,6 +772,10 @@ class ContentProvider {
             return { rows: rows.length, quota: transcription.quota };
         } catch (error) {
             await updateTabState(tabId, { transcriptionProgress: 0, updatedAt: Date.now() });
+            await reportDailyFeatureUsage("transcribe", normalizedSettings, {
+                durationMs: Date.now() - startedAt,
+                tokens: 0
+            }, resolveUsageStatusByError(error), resolveUsageErrorCode(error, "ASR_FAILED"));
             logASR.error("asr_failed", buildFailureLog(error, {
                 bvid,
                 task: "asr",
@@ -1205,6 +1213,7 @@ async function runSingleTask(tabId, bvid, task, force, settings, taskContext = {
     const cache = await getCache(bvid);
     if (!force && cache?.[task]) return cache[task];
     const key = `${bvid}|${task}`;
+    const startedAt = Date.now();
     logBackground.info("task_start", { tab_id: tabId, bvid, task });
     try {
         const result = await runWithDedup(key, () => requestTaskResult(bvid, task, settings, taskContext));
@@ -1220,6 +1229,10 @@ async function runSingleTask(tabId, bvid, task, force, settings, taskContext = {
         return result;
     } catch (error) {
         const status = error?.code === "TIMEOUT" ? "timeout" : "error";
+        await reportDailyFeatureUsage(task, settings, {
+            durationMs: Date.now() - startedAt,
+            tokens: 0
+        }, resolveUsageStatusByError(error), resolveUsageErrorCode(error));
         if (status === "timeout") {
             logBackground.error("task_timeout", buildFailureLog(error, { tab_id: tabId, bvid, task, code: "TIMEOUT" }));
         } else {
@@ -1243,6 +1256,7 @@ async function runSummarySegmentsTasks(tabId, bvid, force, settings, taskContext
         };
     }
     const key = `${bvid}|summary_segments`;
+    const startedAt = Date.now();
     logBackground.info("task_start", { tab_id: tabId, bvid, task: "summary_segments", mode: settings.prefMode });
     const runner = settings.prefMode === "efficiency"
         ? () => runSummarySegmentsInEfficiency(tabId, bvid, force, settings, taskContext)
@@ -1266,6 +1280,10 @@ async function runSummarySegmentsTasks(tabId, bvid, force, settings, taskContext
     const segmentsOk = !!results?.segments?.ok;
     if (!summaryOk && !segmentsOk) {
         const error = results?.summary?.error || results?.segments?.error || new Error("生成失败");
+        await reportDailyFeatureUsage("summary_segments_merged", settings, {
+            durationMs: Date.now() - startedAt,
+            tokens: 0
+        }, resolveUsageStatusByError(error), resolveUsageErrorCode(error, "SUMMARY_SEGMENTS_FAILED"));
         throw error;
     }
     return results;
@@ -1280,6 +1298,7 @@ async function runChatForTab(tabId, text, messageId) {
     const cache = await getCache(bvid);
     const history = Array.isArray(cache.history) ? cache.history : [];
     const key = `${bvid}|chat|${messageId}`;
+    const startedAt = Date.now();
     logBackground.info("task_enqueue", { tab_id: tabId, bvid, tasks: ["chat"] });
     logBackground.info("task_start", { tab_id: tabId, bvid, task: "chat" });
     try {
@@ -1307,6 +1326,10 @@ async function runChatForTab(tabId, text, messageId) {
         return { answer, metrics: lastMetrics || null };
     } catch (error) {
         const status = error?.code === "TIMEOUT" ? "timeout" : "error";
+        await reportDailyFeatureUsage("chat", resolvedSettings, {
+            durationMs: Date.now() - startedAt,
+            tokens: 0
+        }, resolveUsageStatusByError(error), resolveUsageErrorCode(error, "CHAT_FAILED"));
         if (status === "timeout") {
             logBackground.error("task_timeout", buildFailureLog(error, { tab_id: tabId, bvid, task: "chat", code: "TIMEOUT" }));
         } else {
@@ -1334,6 +1357,7 @@ async function runChatForPort(port, msg) {
     const abortKey = `${tabId}|${messageId}`;
     const abortController = new AbortController();
     chatAbortControllers.set(abortKey, abortController);
+    const startedAt = Date.now();
     logBackground.info("task_enqueue", { tab_id: tabId, bvid, tasks: ["chat_stream"] });
     logBackground.info("task_start", { tab_id: tabId, bvid, task: "chat_stream" });
     try {
@@ -1364,11 +1388,19 @@ async function runChatForPort(port, msg) {
         logBackground.info("task_finish", { tab_id: tabId, bvid, tasks: ["chat_stream"] });
     } catch (error) {
         if (error?.code === "ABORTED") {
+            await reportDailyFeatureUsage("chat", resolvedSettings, {
+                durationMs: Date.now() - startedAt,
+                tokens: 0
+            }, "cancelled", "ABORTED");
             await setTaskStatus(tabId, ["chat"], "done");
             safePortPost(port, { type: "aborted", messageId });
             return;
         }
         const status = error?.code === "TIMEOUT" ? "timeout" : "error";
+        await reportDailyFeatureUsage("chat", resolvedSettings, {
+            durationMs: Date.now() - startedAt,
+            tokens: 0
+        }, resolveUsageStatusByError(error), resolveUsageErrorCode(error, "CHAT_STREAM_FAILED"));
         if (status === "timeout") {
             logBackground.error("task_timeout", buildFailureLog(error, { tab_id: tabId, bvid, task: "chat_stream", code: "TIMEOUT" }));
         } else {
@@ -1468,6 +1500,16 @@ function createSummarySegmentsResult() {
 
 function resolveStatusByError(error) {
     return error?.code === "TIMEOUT" ? "timeout" : "error";
+}
+
+function resolveUsageStatusByError(error) {
+    if (error?.code === "ABORTED" || error?.code === "USER_CANCELLED") return "cancelled";
+    if (error?.code === "TIMEOUT") return "timeout";
+    return "failed";
+}
+
+function resolveUsageErrorCode(error, fallback = "UNKNOWN") {
+    return String(error?.code || fallback || "UNKNOWN").trim() || "UNKNOWN";
 }
 
 async function setTaskStatusMap(tabId, statusMap, lastError = "") {
@@ -1689,6 +1731,12 @@ async function runSummarySegmentsInQuality(tabId, bvid, force, settings, taskCon
 
     if (tasks.length) {
         await Promise.allSettled(tasks);
+        if (results.summary?.error) {
+            await reportDailyFeatureUsage("summary", settings, { tokens: 0 }, resolveUsageStatusByError(results.summary.error), resolveUsageErrorCode(results.summary.error, "SUMMARY_FAILED"));
+        }
+        if (results.segments?.error) {
+            await reportDailyFeatureUsage("segments", settings, { tokens: 0 }, resolveUsageStatusByError(results.segments.error), resolveUsageErrorCode(results.segments.error, "SEGMENTS_FAILED"));
+        }
     } else {
         await applySummarySegmentsResults(tabId, bvid, results);
     }
@@ -1863,6 +1911,10 @@ async function runSummarySegmentsInEfficiency(tabId, bvid, force, settings, task
         }
         results.segments = { ok: false, data: null, error };
         await applySummarySegmentsResults(tabId, bvid, results);
+        await reportDailyFeatureUsage("summary_segments_merged", settings, {
+            durationMs: Date.now() - requestStartedAt,
+            tokens: 0
+        }, resolveUsageStatusByError(error), resolveUsageErrorCode(error, "SUMMARY_SEGMENTS_FAILED"));
         logAI.error("ai_request_failed", buildFailureLog(error, {
             task: "summary_segments_merged",
             bvid,
@@ -2340,8 +2392,7 @@ function normalizeSettings(settings) {
     const supabaseUrl = String(base.supabaseUrl || DEFAULT_SETTINGS.supabaseUrl || "").trim().replace(/\/+$/, "");
     const supabaseAnonKey = String(base.supabaseAnonKey || DEFAULT_SETTINGS.supabaseAnonKey || "").trim();
     const supabaseVideoCacheTable = String(base.supabaseVideoCacheTable || DEFAULT_SETTINGS.supabaseVideoCacheTable || SUPABASE_DEFAULT_VIDEO_CACHE_TABLE).trim() || SUPABASE_DEFAULT_VIDEO_CACHE_TABLE;
-    const supabaseUsageRpcName = String(base.supabaseUsageRpcName || DEFAULT_SETTINGS.supabaseUsageRpcName || SUPABASE_DEFAULT_USAGE_RPC).trim() || SUPABASE_DEFAULT_USAGE_RPC;
-    const supabaseUsageStatsTable = String(base.supabaseUsageStatsTable || DEFAULT_SETTINGS.supabaseUsageStatsTable || SUPABASE_DEFAULT_USAGE_STATS_TABLE).trim() || SUPABASE_DEFAULT_USAGE_STATS_TABLE;
+    const supabaseUsageDailyRpcName = String(base.supabaseUsageDailyRpcName || DEFAULT_SETTINGS.supabaseUsageDailyRpcName || SUPABASE_DEFAULT_USAGE_DAILY_RPC).trim() || SUPABASE_DEFAULT_USAGE_DAILY_RPC;
     const prefModeRaw = String(base.prefMode || DEFAULT_SETTINGS.prefMode || "quality").toLowerCase();
     const prefMode = prefModeRaw === "efficiency" ? "efficiency" : "quality";
     const sentryDsn = String(base.sentryDsn || DEFAULT_SETTINGS.sentryDsn || "").trim();
@@ -2360,8 +2411,7 @@ function normalizeSettings(settings) {
         supabaseUrl,
         supabaseAnonKey,
         supabaseVideoCacheTable,
-        supabaseUsageRpcName,
-        supabaseUsageStatsTable,
+        supabaseUsageDailyRpcName,
         prefMode
     };
 }
@@ -2524,7 +2574,7 @@ async function hydrateCloudCacheIfNeeded(bvid, tasks, settings) {
 }
 
 function buildSupabaseVideoPatch(bvid, settings, patch) {
-    const row = { bvid: normalizeBvid(bvid), updated_at: new Date().toISOString() };
+    const row = { bvid: normalizeBvid(bvid) };
     const modelName = getTaskModelName(settings);
     if (Object.prototype.hasOwnProperty.call(patch, "title")) {
         row.title = String(patch.title || "");
@@ -2758,95 +2808,13 @@ async function getOrCreateAnonymousUserId() {
     return created;
 }
 
-async function updateUsageStats(featureName, tokenCount, settings) {
-    if (!isSupabaseEnabled(settings)) return false;
-    const normalizedFeature = String(featureName || "").trim();
-    if (!normalizedFeature) return false;
-    const tableName = String(settings.supabaseUsageStatsTable || SUPABASE_DEFAULT_USAGE_STATS_TABLE).trim() || SUPABASE_DEFAULT_USAGE_STATS_TABLE;
-    const table = encodeURIComponent(tableName);
-    try {
-        const queryUrl = new URL(`${settings.supabaseUrl}/rest/v1/${table}`);
-        queryUrl.searchParams.set("select", "feature_name,usage_count,total_tokens");
-        queryUrl.searchParams.set("feature_name", `eq.${normalizedFeature}`);
-        queryUrl.searchParams.set("limit", "1");
-        const queryRes = await fetch(queryUrl.toString(), {
-            method: "GET",
-            headers: buildSupabaseHeaders(settings, { Accept: "application/json" })
-        });
-        if (!queryRes.ok) {
-            const text = await queryRes.text();
-            throw new Error(`usage_stats 查询失败 ${queryRes.status}: ${text}`);
-        }
-        const rows = await queryRes.json();
-        const current = Array.isArray(rows) && rows.length ? rows[0] : null;
-        const nextRow = {
-            feature_name: normalizedFeature,
-            usage_count: Math.max(0, Number(current?.usage_count || 0)) + 1,
-            total_tokens: Math.max(0, Number(current?.total_tokens || 0)) + tokenCount,
-            updated_at: new Date().toISOString()
-        };
-        const writeMethod = current ? "PATCH" : "POST";
-        const writeUrl = current
-            ? `${settings.supabaseUrl}/rest/v1/${table}?feature_name=eq.${normalizedFeature}`
-            : `${settings.supabaseUrl}/rest/v1/${table}`;
-        const writeRes = await fetch(writeUrl, {
-            method: writeMethod,
-            headers: buildSupabaseHeaders(settings, {
-                "Content-Type": "application/json",
-                Prefer: "return=minimal"
-            }),
-            body: JSON.stringify(current ? {
-                usage_count: nextRow.usage_count,
-                total_tokens: nextRow.total_tokens,
-                updated_at: nextRow.updated_at
-            } : nextRow)
-        });
-        if (!writeRes.ok) {
-            const text = await writeRes.text();
-            throw new Error(`usage_stats 写入失败 ${writeRes.status}: ${text}`);
-        }
-        logAI.info("usage_stats_updated", {
-            feature: normalizedFeature,
-            usage_count: nextRow.usage_count,
-            total_tokens: nextRow.total_tokens
-        });
-        return true;
-    } catch (error) {
-        logBackground.error("usage_stats_update_fail", {
-            feature: normalizedFeature,
-            table: tableName,
-            error: error.message || "usage stats update failed"
-        });
-        return false;
-    }
-}
-
 async function reportFeatureUsage(featureName, bvid, settings, metrics) {
     if (!isSupabaseEnabled(settings)) return false;
     const tokenCount = Math.max(0, Number(metrics?.tokens || 0));
     const normalizedFeature = String(featureName || "").trim();
     if (!normalizedFeature) return false;
     try {
-        const userId = await getOrCreateAnonymousUserId();
-        const url = `${settings.supabaseUrl}/rest/v1/rpc/${encodeURIComponent(settings.supabaseUsageRpcName || SUPABASE_DEFAULT_USAGE_RPC)}`;
-        const res = await fetch(url, {
-            method: "POST",
-            headers: buildSupabaseHeaders(settings, {
-                "Content-Type": "application/json",
-                Accept: "application/json"
-            }),
-            body: JSON.stringify({
-                f_name: normalizedFeature,
-                u_id: userId,
-                t_count: tokenCount,
-                v_id: normalizeBvid(bvid)
-            })
-        });
-        if (!res.ok) {
-            const text = await res.text();
-            throw new Error(`Supabase RPC 失败 ${res.status}: ${text}`);
-        }
-        await updateUsageStats(normalizedFeature, tokenCount, settings);
+        await reportDailyFeatureUsage(normalizedFeature, settings, metrics, "success", "");
         logAI.info("usage_reported", {
             feature: normalizedFeature,
             bvid: normalizeBvid(bvid),
@@ -2858,6 +2826,58 @@ async function reportFeatureUsage(featureName, bvid, settings, metrics) {
             feature: String(featureName || ""),
             bvid: normalizeBvid(bvid),
             error: error.message || "usage report failed"
+        });
+        return false;
+    }
+}
+
+async function reportDailyFeatureUsage(featureName, settings, metrics = {}, status = "success", errorCode = "") {
+    if (!isSupabaseEnabled(settings)) return false;
+    const normalizedFeature = String(featureName || "").trim();
+    if (!normalizedFeature) return false;
+    try {
+        const manifest = chrome.runtime.getManifest();
+        const userId = await getOrCreateAnonymousUserId();
+        const url = `${settings.supabaseUrl}/rest/v1/rpc/${encodeURIComponent(settings.supabaseUsageDailyRpcName || SUPABASE_DEFAULT_USAGE_DAILY_RPC)}`;
+        const res = await fetch(url, {
+            method: "POST",
+            headers: buildSupabaseHeaders(settings, {
+                "Content-Type": "application/json",
+                Accept: "application/json"
+            }),
+            body: JSON.stringify({
+                f_name: normalizedFeature,
+                f_status: String(status || "success"),
+                e_code: String(errorCode || ""),
+                p_provider: String(settings.provider || ""),
+                p_model: String(getTaskModelName(settings) || settings.model || ""),
+                ext_version: String(manifest.version || ""),
+                t_count: Math.max(0, Number(metrics?.tokens || 0)),
+                d_ms: Math.max(0, Number(metrics?.latencyMs || metrics?.durationMs || 0)),
+                u_id: userId
+            })
+        });
+        if (!res.ok) {
+            const text = await res.text();
+            throw new Error(`Supabase daily usage RPC 失败 ${res.status}: ${text}`);
+        }
+        logAI.info("usage_daily_reported", {
+            task: "usage",
+            detail: {
+                feature: normalizedFeature,
+                status: String(status || "success"),
+                tokens: Math.max(0, Number(metrics?.tokens || 0))
+            }
+        });
+        return true;
+    } catch (error) {
+        logBackground.error("usage_daily_report_fail", {
+            task: "usage",
+            code: "USAGE_DAILY_REPORT_FAILED",
+            detail: {
+                feature: normalizedFeature,
+                error_message: error.message || "daily usage report failed"
+            }
         });
         return false;
     }
