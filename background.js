@@ -76,8 +76,11 @@ const DEFAULT_SETTINGS = {
     apiKey: "",
     customBaseUrl: "",
     customProtocol: "openai",
+    asrProvider: "groq",
     groqApiKey: "",
     groqModel: "whisper-large-v3-turbo",
+    siliconFlowApiKey: "",
+    siliconFlowAsrModel: "FunAudioLLM/SenseVoiceSmall",
     supabaseUrl: "https://qdksdauixnbgrgkilgac.supabase.co",
     supabaseAnonKey: "sb_publishable_55zwbZc_sQ0k4EDJBgpxsQ_1F86l1vT",
     supabaseVideoCacheTable: SUPABASE_DEFAULT_VIDEO_CACHE_TABLE,
@@ -2388,8 +2391,11 @@ function isEqualJSON(a, b) {
 function normalizeSettings(settings) {
     const base = settings && typeof settings === "object" ? settings : {};
     const customProtocol = String(base.customProtocol || "openai").toLowerCase() === "claude" ? "claude" : "openai";
+    const asrProvider = String(base.asrProvider || DEFAULT_SETTINGS.asrProvider || "groq").toLowerCase() === "siliconflow" ? "siliconflow" : "groq";
     const groqApiKey = String(base.groqApiKey || "").trim();
     const groqModel = String(base.groqModel || DEFAULT_SETTINGS.groqModel || "whisper-large-v3-turbo").trim() || "whisper-large-v3-turbo";
+    const siliconFlowApiKey = String(base.siliconFlowApiKey || "").trim();
+    const siliconFlowAsrModel = String(base.siliconFlowAsrModel || DEFAULT_SETTINGS.siliconFlowAsrModel || "FunAudioLLM/SenseVoiceSmall").trim() || "FunAudioLLM/SenseVoiceSmall";
     const supabaseUrl = String(base.supabaseUrl || DEFAULT_SETTINGS.supabaseUrl || "").trim().replace(/\/+$/, "");
     const supabaseAnonKey = String(base.supabaseAnonKey || DEFAULT_SETTINGS.supabaseAnonKey || "").trim();
     const supabaseVideoCacheTable = String(base.supabaseVideoCacheTable || DEFAULT_SETTINGS.supabaseVideoCacheTable || SUPABASE_DEFAULT_VIDEO_CACHE_TABLE).trim() || SUPABASE_DEFAULT_VIDEO_CACHE_TABLE;
@@ -2407,8 +2413,11 @@ function normalizeSettings(settings) {
         sentryEnabled,
         sentryDsn,
         customProtocol,
+        asrProvider,
         groqApiKey,
         groqModel,
+        siliconFlowApiKey,
+        siliconFlowAsrModel,
         supabaseUrl,
         supabaseAnonKey,
         supabaseVideoCacheTable,

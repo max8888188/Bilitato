@@ -2442,8 +2442,42 @@ function renderSettings(panel) {
     const promptRumors = String(promptSettings.custom.rumors || "");
     const customProtocol = String(settings.customProtocol || "openai").toLowerCase() === "claude" ? "claude" : "openai";
     const defaultOpenPage = resolveDefaultOpenPage(settings.defaultOpenPage);
+    const modelScopeModelOptions = [
+        "MiniMax/MiniMax-M2.5",
+        "moonshotai/Kimi-K2.5",
+        "GLM-5.1",
+        "deepseek-ai/DeepSeek-V3.2",
+        "Qwen3.5-27B"
+    ];
+    const currentModel = String(settings.model || "").trim();
+    const isModelScopeProvider = providerKey === "modelscope";
+    const modelScopeSelectValue = modelScopeModelOptions.includes(currentModel) ? currentModel : "custom";
+    const modelScopeCustomVisible = isModelScopeProvider && modelScopeSelectValue === "custom" ? "" : "settings-hidden";
+    const modelScopeWrapVisible = isModelScopeProvider ? "" : "settings-hidden";
+    const plainModelVisible = isModelScopeProvider ? "settings-hidden" : "";
+    const asrProviderKey = String(settings.asrProvider || "groq").toLowerCase() === "siliconflow" ? "siliconflow" : "groq";
+    const asrProviders = {
+        groq: {
+            name: "Groq",
+            note: "需科学上网",
+            regUrl: "https://console.groq.com/keys"
+        },
+        siliconflow: {
+            name: "硅基流动",
+            note: "无字幕时间戳",
+            regUrl: "https://cloud.siliconflow.cn/account/ak"
+        }
+    };
+    const asrProvider = asrProviders[asrProviderKey] || asrProviders.groq;
+    const asrOptionsHtml = Object.entries(asrProviders).map(([key, item]) => {
+        const isSelected = key === asrProviderKey;
+        return `<div class="custom-option ${isSelected ? "selected" : ""}" data-value="${escapeHtmlAttr(key)}" data-label="${escapeHtmlAttr(item.name)}"><span>${escapeHtml(item.name)}</span><span class="custom-option-note">${escapeHtml(item.note)}</span></div>`;
+    }).join("");
     const groqModel = String(settings.groqModel || "whisper-large-v3-turbo");
+    const siliconFlowAsrModel = String(settings.siliconFlowAsrModel || "FunAudioLLM/SenseVoiceSmall");
     const customVisible = providerKey === "custom" ? "" : "settings-hidden";
+    const groqVisible = asrProviderKey === "groq" ? "" : "settings-hidden";
+    const siliconFlowVisible = asrProviderKey === "siliconflow" ? "" : "settings-hidden";
     const guidedVisible = promptMode === "guided" ? "" : "settings-hidden";
     const customPromptVisible = promptMode === "custom" ? "" : "settings-hidden";
     panel.innerHTML = `
@@ -2475,7 +2509,14 @@ function renderSettings(panel) {
                 <input id="settings-api-key" type="password" value="${escapeHtml(settings.apiKey || "")}" placeholder="示例：sk-xxxxx">
                 <div class="error-message" id="settings-api-key-error">API Key 不能包含中文或空格</div>
                 <label>Model</label>
-                <input id="settings-model" type="text" value="${escapeHtml(settings.model || "")}" placeholder="示例：gpt-4o-mini / deepseek-chat / glm-4-flash">
+                <div id="settings-modelscope-model-wrap" class="${modelScopeWrapVisible}">
+                    ${renderCustomSelect("settings-modelscope-model", [
+                        ...modelScopeModelOptions.map((model) => ({ value: model, label: model })),
+                        { value: "custom", label: "自定义" }
+                    ], modelScopeSelectValue)}
+                    <input id="settings-modelscope-custom-model" class="${modelScopeCustomVisible}" type="text" value="${escapeHtml(currentModel)}" placeholder="请输入 ModelScope 模型名">
+                </div>
+                <input id="settings-model" class="${plainModelVisible}" type="text" value="${escapeHtml(settings.model || "")}" placeholder="示例：gpt-4o-mini / deepseek-chat / glm-4-flash">
                 <div class="settings-custom-only ${customVisible}">
                     <label>自定义地址协议</label>
                     <select id="settings-custom-protocol">
@@ -2487,10 +2528,35 @@ function renderSettings(panel) {
                     <button type="button" class="panel-btn ghost" data-action="settings-authorize-custom-origin">授权当前域名</button>
                 </div>
                 <div class="settings-group-title">ASR（音频识别）模型配置</div>
-                <label>Groq API Key</label>
-                <input id="settings-groq-api-key" type="password" value="${escapeHtml(settings.groqApiKey || "")}" placeholder="示例：gsk_xxxxx">
-                <label>Groq 模型</label>
-                <input id="settings-groq-model" type="text" value="${escapeHtml(groqModel)}" placeholder="示例：whisper-large-v3-turbo">
+                <label>ASR Provider</label>
+                <div class="settings-provider-row">
+                    <select id="settings-asr-provider" class="settings-native-select-hidden">
+                        <option value="groq" ${asrProviderKey === "groq" ? "selected" : ""}>Groq</option>
+                        <option value="siliconflow" ${asrProviderKey === "siliconflow" ? "selected" : ""}>硅基流动</option>
+                    </select>
+                    <div class="custom-select-container settings-custom-select" id="settings-asr-provider-select" data-target-select="settings-asr-provider">
+                        <div class="custom-select-trigger">
+                            <span class="current-value">${escapeHtml(asrProvider.name)}</span>
+                            ${arrowIcon}
+                        </div>
+                        <div class="custom-select-options">
+                            ${asrOptionsHtml}
+                        </div>
+                    </div>
+                    <button class="panel-btn ghost" data-action="settings-open-reg" data-register-kind="asr" data-url="${escapeHtml(asrProvider.regUrl || "")}">注册</button>
+                </div>
+                <div id="settings-asr-groq-wrap" class="settings-asr-provider-fields ${groqVisible}">
+                    <label>Groq API Key</label>
+                    <input id="settings-groq-api-key" type="password" value="${escapeHtml(settings.groqApiKey || "")}" placeholder="示例：gsk_xxxxx">
+                    <label>ASR 模型</label>
+                    <input id="settings-groq-model" type="text" value="${escapeHtml(groqModel)}" placeholder="示例：whisper-large-v3-turbo">
+                </div>
+                <div id="settings-asr-siliconflow-wrap" class="settings-asr-provider-fields ${siliconFlowVisible}">
+                    <label>硅基流动 API Key</label>
+                    <input id="settings-siliconflow-api-key" type="password" value="${escapeHtml(settings.siliconFlowApiKey || "")}" placeholder="示例：sk-xxxxx">
+                    <label>ASR 模型</label>
+                    <input id="settings-siliconflow-asr-model" type="text" value="${escapeHtml(siliconFlowAsrModel)}" placeholder="示例：FunAudioLLM/SenseVoiceSmall">
+                </div>
                 <div class="settings-group-title">个性化</div>
                 <label>修改模式</label>
                 ${renderCustomSelect("settings-prompt-mode", [
@@ -2539,7 +2605,10 @@ function renderSettings(panel) {
                 </div>
                 <button type="button" class="panel-btn ghost" data-action="settings-reset-prompts">恢复默认</button>
                 <div class="settings-group-title">调用与显示模式</div>
-                <label>调用模式</label>
+                <label class="settings-label-with-info">
+                    <span>调用模式</span>
+                    <span class="settings-info-icon" data-tooltip="质量：总结和分段分别生成，更准但更慢。节流：一次生成总结+分段，更省次数。">i</span>
+                </label>
                 ${renderCustomSelect("settings-pref-mode", [
                     { value: "quality", label: "质量模式" },
                     { value: "efficiency", label: "节流模式" }
@@ -2641,6 +2710,11 @@ function renderSettings(panel) {
 
     panel.querySelector("#settings-base-url")?.addEventListener("input", () => updateSettingsProviderHint(panel));
     updateSettingsProviderHint(panel);
+    const asrProviderSelect = panel.querySelector("#settings-asr-provider");
+    if (asrProviderSelect) {
+        asrProviderSelect.addEventListener("change", () => updateSettingsAsrProviderHint(panel));
+    }
+    updateSettingsAsrProviderHint(panel);
 
     // Dynamic Slider Fill Logic
     const updateSliderFill = (slider) => {
@@ -2675,6 +2749,20 @@ function renderSettings(panel) {
     const promptModeSelect = panel.querySelector("#settings-prompt-mode");
     const promptGuidedWrap = panel.querySelector("#settings-prompt-guided-wrap");
     const promptCustomWrap = panel.querySelector("#settings-prompt-custom-wrap");
+    const modelScopeModelSelect = panel.querySelector("#settings-modelscope-model");
+    const modelScopeCustomInput = panel.querySelector("#settings-modelscope-custom-model");
+    const applyModelScopeModelVisibility = () => {
+        if (modelScopeCustomInput) {
+            modelScopeCustomInput.classList.toggle("settings-hidden", String(modelScopeModelSelect?.value || "") !== "custom");
+        }
+    };
+    if (modelScopeModelSelect) {
+        modelScopeModelSelect.addEventListener("change", () => {
+            applyModelScopeModelVisibility();
+            triggerAutoSave();
+        });
+    }
+    applyModelScopeModelVisibility();
     const applyPromptModeVisibility = () => {
         const mode = String(promptModeSelect?.value || "guided") === "custom" ? "custom" : "guided";
         if (promptGuidedWrap) promptGuidedWrap.classList.toggle("settings-hidden", mode !== "guided");
@@ -3442,9 +3530,19 @@ function updateSettingsProviderHint(panel) {
     const urlNode = panel?.querySelector(".settings-provider-url");
     const regBtn = panel?.querySelector('[data-action="settings-open-reg"]');
     const customWrap = panel?.querySelector(".settings-custom-only");
+    const modelScopeWrap = panel?.querySelector("#settings-modelscope-model-wrap");
+    const plainModelInput = panel?.querySelector("#settings-model");
+    const modelScopeSelect = panel?.querySelector("#settings-modelscope-model");
+    const modelScopeCustomInput = panel?.querySelector("#settings-modelscope-custom-model");
     const customBase = String(panel?.querySelector("#settings-base-url")?.value || "").trim();
     const isCustom = key === "custom";
+    const isModelScope = key === "modelscope";
     if (customWrap) customWrap.classList.toggle("settings-hidden", !isCustom);
+    if (modelScopeWrap) modelScopeWrap.classList.toggle("settings-hidden", !isModelScope);
+    if (plainModelInput) plainModelInput.classList.toggle("settings-hidden", isModelScope);
+    if (modelScopeCustomInput) {
+        modelScopeCustomInput.classList.toggle("settings-hidden", !isModelScope || String(modelScopeSelect?.value || "") !== "custom");
+    }
     if (urlNode) {
         urlNode.textContent = isCustom ? (customBase || "请填写自定义 Base URL") : (provider.baseUrl || "-");
     }
@@ -3452,6 +3550,30 @@ function updateSettingsProviderHint(panel) {
         regBtn.dataset.url = isCustom ? "" : (provider.regUrl || "");
         regBtn.disabled = isCustom;
     }
+}
+
+function updateSettingsAsrProviderHint(panel) {
+    const asrProviders = {
+        groq: {
+            note: "需科学上网",
+            regUrl: "https://console.groq.com/keys"
+        },
+        siliconflow: {
+            note: "无字幕时间戳",
+            regUrl: "https://cloud.siliconflow.cn/account/ak"
+        }
+    };
+    const key = String(panel?.querySelector("#settings-asr-provider")?.value || "groq").toLowerCase() === "siliconflow" ? "siliconflow" : "groq";
+    const provider = asrProviders[key] || asrProviders.groq;
+    const regBtn = panel?.querySelector('[data-register-kind="asr"]');
+    const groqWrap = panel?.querySelector("#settings-asr-groq-wrap");
+    const siliconFlowWrap = panel?.querySelector("#settings-asr-siliconflow-wrap");
+    if (regBtn) {
+        regBtn.dataset.url = provider.regUrl;
+        regBtn.disabled = false;
+    }
+    if (groqWrap) groqWrap.classList.toggle("settings-hidden", key !== "groq");
+    if (siliconFlowWrap) siliconFlowWrap.classList.toggle("settings-hidden", key !== "siliconflow");
 }
 
 async function authorizeCustomOriginFromPanel() {
@@ -3544,7 +3666,7 @@ function bindSettingsCustomSelects(panel) {
                 event.stopPropagation();
                 const value = String(option.dataset.value || "");
                 nativeSelect.value = value;
-                selectContainer.querySelector(".current-value").textContent = option.textContent || "";
+                selectContainer.querySelector(".current-value").textContent = option.dataset.label || option.textContent || "";
                 selectOptions.querySelectorAll(".custom-option").forEach((item) => item.classList.remove("selected"));
                 option.classList.add("selected");
                 selectContainer.classList.remove("open");
@@ -3601,15 +3723,24 @@ async function saveSettingsFromPanel(isAutoSave = false, options = {}) {
     const detailVal = Number(panel.querySelector("#settings-prompt-detail")?.value ?? 1);
     const promptTone = toneVal === 0 ? "casual" : (toneVal === 2 ? "professional" : "balanced");
     const promptDetail = detailVal === 0 ? "brief" : (detailVal === 2 ? "detailed" : "normal");
+    const modelScopeModelValue = String(panel.querySelector("#settings-modelscope-model")?.value || "").trim();
+    const resolvedModelValue = providerValue === "modelscope"
+        ? (modelScopeModelValue === "custom"
+            ? String(panel.querySelector("#settings-modelscope-custom-model")?.value || "").trim()
+            : modelScopeModelValue)
+        : String(panel.querySelector("#settings-model")?.value || "").trim();
 
     const payload = {
         provider: providerValue,
         apiKey: String(panel.querySelector("#settings-api-key")?.value || "").trim(),
-        model: String(panel.querySelector("#settings-model")?.value || "").trim(),
+        model: resolvedModelValue,
         customBaseUrl: String(panel.querySelector("#settings-base-url")?.value || "").trim(),
         customProtocol: customProtocolValue === "claude" ? "claude" : "openai",
+        asrProvider: String(panel.querySelector("#settings-asr-provider")?.value || "groq").toLowerCase() === "siliconflow" ? "siliconflow" : "groq",
         groqApiKey: String(panel.querySelector("#settings-groq-api-key")?.value || "").trim(),
         groqModel: String(panel.querySelector("#settings-groq-model")?.value || "").trim(),
+        siliconFlowApiKey: String(panel.querySelector("#settings-siliconflow-api-key")?.value || "").trim(),
+        siliconFlowAsrModel: String(panel.querySelector("#settings-siliconflow-asr-model")?.value || "").trim(),
         prefMode: panel.querySelector("#settings-pref-mode")?.value || "quality",
         defaultOpenPage,
         sentryEnabled: panel.querySelector("#settings-sentry-enabled")?.value === "true",
