@@ -18,6 +18,7 @@ import {
 import { normalizeRumors as normalizeRumorsResult, normalizeSegments as normalizeSegmentsResult } from "./utils/resultNormalize.js";
 import { reportToSentry } from "./utils/sentryReporter.js";
 import { createAppError, createHttpError, serializeAppError } from "./utils/appError.js";
+import { isSupabaseEnabled, supabaseRpc, supabaseSelect, supabaseWrite } from "./utils/supabaseClient.js";
 import "./logger.js";
 
 let IS_DEBUG_MODE = false;
@@ -2425,19 +2426,6 @@ function hasTaskResult(cache, task) {
     return false;
 }
 
-function isSupabaseEnabled(settings) {
-    return !!String(settings?.supabaseUrl || "").trim() && !!String(settings?.supabaseAnonKey || "").trim();
-}
-
-function buildSupabaseHeaders(settings, extra = {}) {
-    const apiKey = String(settings?.supabaseAnonKey || "").trim();
-    return {
-        apikey: apiKey,
-        Authorization: `Bearer ${apiKey}`,
-        ...extra
-    };
-}
-
 function getTaskModelName(settings) {
     const configured = String(settings?.model || "").trim();
     if (configured) return configured;
@@ -2528,19 +2516,14 @@ async function fetchCloudVideoCacheRow(bvid, tasks, settings) {
     if (!isSupabaseEnabled(settings)) return null;
     const normalizedBvid = normalizeBvid(bvid);
     if (!normalizedBvid) return null;
-    const url = new URL(`${settings.supabaseUrl}/rest/v1/${encodeURIComponent(settings.supabaseVideoCacheTable || SUPABASE_DEFAULT_VIDEO_CACHE_TABLE)}`);
-    url.searchParams.set("select", buildCloudSelectColumns(tasks).join(","));
-    url.searchParams.set("bvid", `eq.${normalizedBvid}`);
-    url.searchParams.set("limit", "1");
-    const res = await fetch(url.toString(), {
-        method: "GET",
-        headers: buildSupabaseHeaders(settings, { Accept: "application/json" })
+    const rows = await supabaseSelect(settings, settings.supabaseVideoCacheTable || SUPABASE_DEFAULT_VIDEO_CACHE_TABLE, {
+        select: buildCloudSelectColumns(tasks).join(","),
+        bvid: `eq.${normalizedBvid}`,
+        limit: "1"
+    }, {
+        requestName: "cloud_video_cache_fetch",
+        errorMessage: "Supabase 查询失败"
     });
-    if (!res.ok) {
-        const text = await res.text();
-        throw new Error(`Supabase 查询失败 ${res.status}: ${text}`);
-    }
-    const rows = await res.json();
     return Array.isArray(rows) && rows.length ? rows[0] : null;
 }
 
@@ -2577,7 +2560,8 @@ function buildSupabaseVideoPatch(bvid, settings, patch) {
     const row = { bvid: normalizeBvid(bvid) };
     const modelName = getTaskModelName(settings);
     if (Object.prototype.hasOwnProperty.call(patch, "title")) {
-        row.title = String(patch.title || "");
+        const title = String(patch.title || "").trim();
+        if (title) row.title = title;
     }
     if (Object.prototype.hasOwnProperty.call(patch, "rawSubtitle")) {
         row.raw_subtitle = normalizeRawSubtitle(Array.isArray(patch.rawSubtitle) ? patch.rawSubtitle : []);
@@ -2656,44 +2640,29 @@ async function fetchVideoCacheMetaRow(bvid, settings, columns = []) {
         .filter(Boolean)
         .filter((value, index, arr) => arr.indexOf(value) === index);
     if (!normalizedBvid || fieldList.length < 2) return null;
-    const url = new URL(`${settings.supabaseUrl}/rest/v1/${encodeURIComponent(settings.supabaseVideoCacheTable || SUPABASE_DEFAULT_VIDEO_CACHE_TABLE)}`);
-    url.searchParams.set("select", fieldList.join(","));
-    url.searchParams.set("bvid", `eq.${normalizedBvid}`);
-    url.searchParams.set("limit", "1");
-    const res = await fetch(url.toString(), {
-        method: "GET",
-        headers: buildSupabaseHeaders(settings, { Accept: "application/json" })
+    const rows = await supabaseSelect(settings, settings.supabaseVideoCacheTable || SUPABASE_DEFAULT_VIDEO_CACHE_TABLE, {
+        select: fieldList.join(","),
+        bvid: `eq.${normalizedBvid}`,
+        limit: "1"
+    }, {
+        requestName: "video_cache_meta_fetch",
+        errorMessage: "video_cache 查询失败"
     });
-    if (!res.ok) {
-        const text = await res.text();
-        throw new Error(`video_cache 查询失败 ${res.status}: ${text}`);
-    }
-    const rows = await res.json();
     return Array.isArray(rows) && rows.length ? rows[0] : null;
 }
 
 async function saveVideoCacheRow(bvid, settings, row, existingRow = null) {
     const normalizedBvid = normalizeBvid(bvid);
     if (!isSupabaseEnabled(settings) || !normalizedBvid || !row || typeof row !== "object") return false;
-    const table = encodeURIComponent(settings.supabaseVideoCacheTable || SUPABASE_DEFAULT_VIDEO_CACHE_TABLE);
+    const table = settings.supabaseVideoCacheTable || SUPABASE_DEFAULT_VIDEO_CACHE_TABLE;
     const hasExisting = !!(existingRow && typeof existingRow === "object" && String(existingRow.bvid || "").trim());
     const method = hasExisting ? "PATCH" : "POST";
-    const url = hasExisting
-        ? `${settings.supabaseUrl}/rest/v1/${table}?bvid=eq.${normalizedBvid}`
-        : `${settings.supabaseUrl}/rest/v1/${table}`;
-    const headers = buildSupabaseHeaders(settings, {
-        "Content-Type": "application/json",
-        Prefer: "return=minimal"
-    });
-    const res = await fetch(url, {
+    await supabaseWrite(settings, table, row, {
         method,
-        headers,
-        body: JSON.stringify(row)
+        params: hasExisting ? { bvid: `eq.${normalizedBvid}` } : {},
+        requestName: "video_cache_write",
+        errorMessage: `video_cache ${method} 失败`
     });
-    if (!res.ok) {
-        const text = await res.text();
-        throw new Error(`video_cache ${method} 失败 ${res.status}: ${text}`);
-    }
     return true;
 }
 
@@ -2774,7 +2743,12 @@ async function incrementCloudVideoCallCount(bvid, settings, task) {
 async function persistCloudFeaturePatch(bvid, settings, patch) {
     if (!isSupabaseEnabled(settings)) return false;
     const filteredPatch = filterCloudFeaturePatch(patch || {});
-    const row = buildSupabaseVideoPatch(bvid, settings, filteredPatch);
+    const cache = await getCache(bvid);
+    const title = String(cache?.title || "").trim();
+    const row = buildSupabaseVideoPatch(bvid, settings, {
+        ...filteredPatch,
+        ...(title ? { title } : {})
+    });
     const meaningfulKeys = Object.keys(row).filter((key) => key !== "bvid" && key !== "updated_at");
     if (!row.bvid || !meaningfulKeys.length) {
         logCache.info("cloud_cache_skip", {
@@ -2838,29 +2812,20 @@ async function reportDailyFeatureUsage(featureName, settings, metrics = {}, stat
     try {
         const manifest = chrome.runtime.getManifest();
         const userId = await getOrCreateAnonymousUserId();
-        const url = `${settings.supabaseUrl}/rest/v1/rpc/${encodeURIComponent(settings.supabaseUsageDailyRpcName || SUPABASE_DEFAULT_USAGE_DAILY_RPC)}`;
-        const res = await fetch(url, {
-            method: "POST",
-            headers: buildSupabaseHeaders(settings, {
-                "Content-Type": "application/json",
-                Accept: "application/json"
-            }),
-            body: JSON.stringify({
-                f_name: normalizedFeature,
-                f_status: String(status || "success"),
-                e_code: String(errorCode || ""),
-                p_provider: String(settings.provider || ""),
-                p_model: String(getTaskModelName(settings) || settings.model || ""),
-                ext_version: String(manifest.version || ""),
-                t_count: Math.max(0, Number(metrics?.tokens || 0)),
-                d_ms: Math.max(0, Number(metrics?.latencyMs || metrics?.durationMs || 0)),
-                u_id: userId
-            })
+        await supabaseRpc(settings, settings.supabaseUsageDailyRpcName || SUPABASE_DEFAULT_USAGE_DAILY_RPC, {
+            f_name: normalizedFeature,
+            f_status: String(status || "success"),
+            e_code: String(errorCode || ""),
+            p_provider: String(settings.provider || ""),
+            p_model: String(getTaskModelName(settings) || settings.model || ""),
+            ext_version: String(manifest.version || ""),
+            t_count: Math.max(0, Number(metrics?.tokens || 0)),
+            d_ms: Math.max(0, Number(metrics?.latencyMs || metrics?.durationMs || 0)),
+            u_id: userId
+        }, {
+            requestName: "usage_daily_report",
+            errorMessage: "Supabase daily usage RPC 失败"
         });
-        if (!res.ok) {
-            const text = await res.text();
-            throw new Error(`Supabase daily usage RPC 失败 ${res.status}: ${text}`);
-        }
         logAI.info("usage_daily_reported", {
             task: "usage",
             detail: {
