@@ -1551,7 +1551,7 @@ function renderSummary(panel) {
             `;
             return;
         }
-        const hasSubtitle = Array.isArray(appState.cache?.rawSubtitle) && appState.cache.rawSubtitle.length > 0;
+        const hasSubtitle = hasUsableSubtitleCache(appState.cache, resolveCurrentBvid());
         let btnDisabled = (!hasSubtitle && !isTranscriptionRunning()) ? "disabled" : "";
         let tipText = hasSubtitle ? "去除噪音，抓住重点。" : "当前视频未检测到字幕，无法总结";
         let btnOpacity = (hasSubtitle || isTranscriptionRunning()) ? "1" : "0.5";
@@ -4279,7 +4279,7 @@ async function triggerDefaultSubtitleCapture() {
     const bvid = resolveCurrentBvid();
     if (!bvid) return;
     if (appState.subtitleCapturedBvid === bvid) return;
-    if (Array.isArray(appState.cache?.rawSubtitle) && appState.cache.rawSubtitle.length) {
+    if (hasUsableSubtitleCache(appState.cache, bvid)) {
         appState.subtitleCapturedBvid = bvid;
         return;
     }
@@ -4379,7 +4379,7 @@ function evaluateTranscriptionNeedAfterDelay(meta) {
     if (isTranscriptionRunning()) return; // Skip warnings/updates if transcribing
     if (Date.now() < Number(appState.subtitleObserveUntil || 0)) return;
     if (appState.subtitleCapturedBvid === bvid) return;
-    if (Array.isArray(appState.cache?.rawSubtitle) && appState.cache.rawSubtitle.length) return;
+    if (hasUsableSubtitleCache(appState.cache, bvid)) return;
     if ((Array.isArray(appState.subtitleTimeline) ? appState.subtitleTimeline : []).length > 0) return;
     if (appState.subtitleDomDetected || hasNativeCCSubtitleDom()) return;
     appState.transcriptionCapsuleMeta = {
@@ -4649,6 +4649,18 @@ function resolveCid() {
 
 function resolveCurrentBvid() {
     return resolveCurrentBvidFromState(appState, location.href);
+}
+
+function hasUsableSubtitleCache(cache, targetBvid = "") {
+    const target = normalizeBvidCase(targetBvid || "");
+    const cacheBvid = normalizeBvidCase(cache?.bvid || "");
+
+    if (target && cacheBvid && target !== cacheBvid) return false;
+
+    return (
+        (Array.isArray(cache?.rawSubtitle) && cache.rawSubtitle.length > 0) ||
+        (Array.isArray(cache?.processedSubtitle) && cache.processedSubtitle.length > 0)
+    );
 }
 
 function makeShortDigest(value) {

@@ -15,8 +15,15 @@
 
     function canRunTasksWithCache(tasks, currentBvid, cache) {
         if (!needsSubtitleForTasks(tasks)) return true;
-        const hasSubtitle = Array.isArray(cache?.rawSubtitle) && cache.rawSubtitle.length > 0;
-        return !!currentBvid && cache?.bvid === currentBvid && hasSubtitle;
+    
+        const current = String(currentBvid || "").toLowerCase();
+        const cacheBvid = String(cache?.bvid || "").toLowerCase();
+    
+        const hasSubtitle =
+            (Array.isArray(cache?.rawSubtitle) && cache.rawSubtitle.length > 0) ||
+            (Array.isArray(cache?.processedSubtitle) && cache.processedSubtitle.length > 0);
+    
+        return !!current && cacheBvid === current && hasSubtitle;
     }
 
     function createChatMessageId(now = Date.now(), randomText = Math.random().toString(36)) {
