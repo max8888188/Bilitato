@@ -61,6 +61,7 @@ const MAX_SUBTITLE_CHARS = 36000;
 const GROQ_AUDIO_TRANSCRIBE_URL = "https://api.groq.com/openai/v1/audio/transcriptions";
 const GROQ_MAX_AUDIO_BYTES = 24 * 1024 * 1024;
 const DOWNLOAD_HEADER_RULE_ID = 910001;
+const BILI_PLAYURL_API = "https://api.bilibili.com/x/player/playurl";
 const SUPABASE_DEFAULT_VIDEO_CACHE_TABLE = "video_cache";
 const SUPABASE_DEFAULT_USAGE_DAILY_RPC = "increment_feature_usage_daily";
 const DEFAULT_SENTRY_DSN = "https://04879b2bd5fc72eba741a402e26c4790@o4511384082055168.ingest.de.sentry.io/4511384299634768";
@@ -102,6 +103,7 @@ const chatAbortControllers = new Map();
 const tabStateCache = new Map();
 const tabStateWriteTimers = new Map();
 const cacheMemory = new Map();
+const recentAsrAudioFingerprints = new Map();
 let currentDebugMode = false;
 const fallbackLoggerFactory = {
     create() {
@@ -354,6 +356,11 @@ async function handleMessage(msg, sender) {
         const status = await probeUrlStatus(url);
         return { status };
     }
+    if (msg.action === "GET_COMPAT_PLAYURL") {
+        if (!sender.tab?.id && !msg.tabId) throw new Error("tabId 缺失");
+        const result = await getCompatPlayUrlForTab(msg.tabId || sender.tab.id, msg.payload || {});
+        return result;
+    }
     if (msg.action === "LOG_ENTRY") {
         if (msg.entry && typeof msg.entry === "object") {
             pushGlobalLog(msg.entry);
@@ -526,9 +533,302 @@ function getUrlMeta(url) {
     }
 }
 
+function bytesToHex(bytes) {
+    return Array.from(bytes || [])
+        .map((value) => Number(value || 0).toString(16).padStart(2, "0"))
+        .join("");
+}
+
+async function sha256Hex(input) {
+    try {
+        const bytes = input instanceof ArrayBuffer
+            ? input
+            : new TextEncoder().encode(String(input || "")).buffer;
+        const digest = await crypto.subtle.digest("SHA-256", bytes);
+        return bytesToHex(new Uint8Array(digest));
+    } catch (_) {
+        return "";
+    }
+}
+
+async function summarizeMediaLocator(locator) {
+    const raw = String(locator || "").trim();
+    if (!raw) return { audio_host: "", audio_path_sha256: "", audio_query_key_count: 0 };
+    try {
+        const parsed = new URL(raw);
+        const queryKeys = [...parsed.searchParams.keys()].sort();
+        return {
+            audio_host: parsed.host || "",
+            audio_protocol: parsed.protocol || "",
+            audio_path_sha256: (await sha256Hex(`${parsed.pathname || ""}?${parsed.search || ""}`)).slice(0, 16),
+            audio_query_key_count: queryKeys.length,
+            audio_query_keys_sha256: (await sha256Hex(queryKeys.join("|"))).slice(0, 16)
+        };
+    } catch (_) {
+        return {
+            audio_host: "",
+            audio_protocol: "",
+            audio_path_sha256: (await sha256Hex(raw)).slice(0, 16),
+            audio_query_key_count: 0,
+            audio_query_keys_sha256: ""
+        };
+    }
+}
+
+async function summarizeAudioBlob(blob) {
+    if (!blob) return { audio_sha256: "", audio_head_tail_sha256: "", audio_bytes: 0, audio_mime: "" };
+    const size = Number(blob.size || 0);
+    const mime = String(blob.type || "");
+    try {
+        const buffer = await blob.arrayBuffer();
+        const fullHash = await sha256Hex(buffer);
+        const bytes = new Uint8Array(buffer);
+        const sampleSize = Math.min(65536, bytes.length);
+        const sample = new Uint8Array(sampleSize * 2);
+        sample.set(bytes.slice(0, sampleSize), 0);
+        sample.set(bytes.slice(Math.max(0, bytes.length - sampleSize)), sampleSize);
+        return {
+            audio_sha256: fullHash.slice(0, 24),
+            audio_head_tail_sha256: (await sha256Hex(sample.buffer)).slice(0, 24),
+            audio_bytes: size,
+            audio_mime: mime
+        };
+    } catch (_) {
+        return { audio_sha256: "", audio_head_tail_sha256: "", audio_bytes: size, audio_mime: mime };
+    }
+}
+
+function assertAsrAudioNotReused(bvid, audioDigest, context = {}) {
+    const normalizedBvid = normalizeBvid(bvid);
+    const audioHash = String(audioDigest?.audio_sha256 || "").trim();
+    if (!normalizedBvid || !audioHash) return;
+    const prev = recentAsrAudioFingerprints.get(audioHash);
+    if (prev?.bvid && prev.bvid !== normalizedBvid) {
+        logASR.error("asr_audio_reuse_blocked", {
+            bvid: normalizedBvid,
+            task: "asr",
+            provider: context.provider || "",
+            model: context.model || "",
+            code: "ASR_AUDIO_REUSED_ACROSS_BVID",
+            detail: {
+                run_id: context.runId || "",
+                previous_bvid: prev.bvid,
+                previous_run_id: prev.runId || "",
+                audio_sha256: audioHash,
+                audio_bytes: Number(audioDigest?.audio_bytes || 0),
+                audio_host: context.audioHost || ""
+            }
+        });
+        throw createAppError("ASR_AUDIO_REUSED_ACROSS_BVID", "检测到当前视频音频和上一个视频重复，已阻止转录。请刷新页面后重试");
+    }
+    recentAsrAudioFingerprints.set(audioHash, {
+        bvid: normalizedBvid,
+        runId: context.runId || "",
+        at: Date.now()
+    });
+    if (recentAsrAudioFingerprints.size > 30) {
+        const entries = [...recentAsrAudioFingerprints.entries()].sort((a, b) => Number(a[1]?.at || 0) - Number(b[1]?.at || 0));
+        entries.slice(0, recentAsrAudioFingerprints.size - 30).forEach(([key]) => recentAsrAudioFingerprints.delete(key));
+    }
+}
+
 function getFileExtension(filename) {
     const match = String(filename || "").toLowerCase().match(/\.([a-z0-9]{1,8})(?:$|\?)/);
     return match ? match[1] : "";
+}
+
+function getBiliQualityDesc(quality) {
+    const id = Number(quality || 0);
+    const map = {
+        6: "240P 极速",
+        16: "360P 流畅",
+        32: "480P 清晰",
+        64: "720P 高清",
+        74: "720P60 高帧率",
+        80: "1080P 高清",
+        112: "1080P+ 高码率",
+        116: "1080P60 高帧率",
+        120: "4K 超清",
+        125: "HDR 真彩",
+        126: "杜比视界",
+        127: "8K 超高清"
+    };
+    return map[id] || (id ? `${id} 清晰度` : "默认清晰度");
+}
+
+function pickBiliQualityDesc(quality, acceptQuality = [], acceptDescription = []) {
+    const id = Number(quality || 0);
+    const index = Array.isArray(acceptQuality) ? acceptQuality.findIndex((item) => Number(item) === id) : -1;
+    const fromApi = index >= 0 && Array.isArray(acceptDescription) ? String(acceptDescription[index] || "").trim() : "";
+    return fromApi || getBiliQualityDesc(id);
+}
+
+function normalizeBiliUrl(value) {
+    const raw = String(value || "").trim();
+    if (!raw) return "";
+    return raw.startsWith("//") ? `https:${raw}` : raw;
+}
+
+async function getCurrentBiliVideoIdentity(tabId, fallback = {}) {
+    const fallbackBvid = normalizeBvid(fallback?.bvid);
+    const fallbackCid = Number(fallback?.cid || 0);
+    try {
+        const results = await chrome.scripting.executeScript({
+            target: { tabId },
+            world: "MAIN",
+            func: (fallbackData) => {
+                const state = globalThis.__INITIAL_STATE__ || {};
+                const videoData = state.videoData || state?.reduxAsyncConnect?.videoData || {};
+                const pages = Array.isArray(videoData.pages) ? videoData.pages : [];
+                const params = new URLSearchParams(String(location?.search || ""));
+                const pageIndex = Math.max(1, Number(state.p || params.get("p") || fallbackData.page || 1) || 1);
+                const page = pages[pageIndex - 1] || pages.find((item) => Number(item?.cid || 0) === Number(fallbackData.cid || 0)) || pages[0] || {};
+                const href = String(location?.href || "");
+                const routeBvid = href.match(/\/video\/(BV[0-9A-Za-z]+)/i)?.[1] || "";
+                const title = String(videoData.title || document?.title || "").replace(/_哔哩哔哩_bilibili\s*$/i, "").trim();
+                return {
+                    aid: Number(videoData.aid || fallbackData.aid || 0),
+                    bvid: String(videoData.bvid || routeBvid || fallbackData.bvid || "").trim(),
+                    cid: Number(page.cid || fallbackData.cid || 0),
+                    page: pageIndex,
+                    title
+                };
+            },
+            args: [{ bvid: fallbackBvid, cid: fallbackCid, aid: Number(fallback?.aid || 0), page: Number(fallback?.page || 1) }]
+        });
+        const identity = results?.[0]?.result || {};
+        return {
+            aid: Number(identity.aid || fallback?.aid || 0),
+            rawBvid: String(identity.bvid || fallback?.bvid || "").trim(),
+            bvid: normalizeBvid(identity.bvid || fallbackBvid),
+            cid: Number(identity.cid || fallbackCid || 0),
+            page: Number(identity.page || fallback?.page || 1),
+            title: String(identity.title || fallback?.title || "").trim()
+        };
+    } catch (_) {
+        return {
+            aid: Number(fallback?.aid || 0),
+            rawBvid: String(fallback?.bvid || "").trim(),
+            bvid: fallbackBvid,
+            cid: fallbackCid,
+            page: Number(fallback?.page || 1),
+            title: String(fallback?.title || "").trim()
+        };
+    }
+}
+
+async function fetchBiliPlayUrl(identity, options = {}) {
+    const cid = Number(identity?.cid || 0);
+    const aid = Number(identity?.aid || 0);
+    const bvid = normalizeBvid(identity?.bvid || "");
+    const rawBvid = String(identity?.rawBvid || identity?.bvid || "").trim();
+    if (!cid || (!aid && !bvid)) {
+        throw createAppError("DOWNLOAD_PLAYINFO_MISSING", "缺少当前视频 aid/cid，无法获取兼容下载链接");
+    }
+    const params = new URLSearchParams({
+        otype: "json",
+        platform: "html5",
+        cid: String(cid),
+        fnver: "0",
+        high_quality: "1",
+        fnval: String(options.fnval || 1)
+    });
+    if (aid) params.set("avid", String(aid));
+    if (rawBvid) params.set("bvid", rawBvid);
+    if (Number(options.qn || 0)) params.set("qn", String(Number(options.qn)));
+    const response = await fetch(`${BILI_PLAYURL_API}?${params.toString()}`, {
+        method: "GET",
+        credentials: "include"
+    });
+    if (!response.ok) {
+        const error = createHttpError(response.status, `B站播放接口请求失败：HTTP ${response.status}`);
+        error.code = "DOWNLOAD_PLAYURL_API_FAILED";
+        throw error;
+    }
+    const json = await response.json();
+    if (Number(json?.code || 0) !== 0) {
+        throw createAppError("DOWNLOAD_PLAYURL_API_FAILED", String(json?.message || "B站播放接口返回失败"));
+    }
+    return json?.data || {};
+}
+
+function buildCompatVideoPayload(data, identity, selectedQn = 0) {
+    const acceptQuality = Array.isArray(data?.accept_quality) ? data.accept_quality.map(Number).filter(Boolean) : [];
+    const acceptDescription = Array.isArray(data?.accept_description) ? data.accept_description : [];
+    const qualities = acceptQuality.length
+        ? acceptQuality.map((quality) => ({
+            quality,
+            desc: pickBiliQualityDesc(quality, acceptQuality, acceptDescription)
+        }))
+        : [Number(data?.quality || selectedQn || 80)].filter(Boolean).map((quality) => ({
+            quality,
+            desc: pickBiliQualityDesc(quality, acceptQuality, acceptDescription)
+        }));
+    const durlList = Array.isArray(data?.durl) ? data.durl : [];
+    const first = durlList.find((item) => normalizeBiliUrl(item?.url)) || durlList[0] || null;
+    const primaryUrl = normalizeBiliUrl(first?.url || "");
+    const backupUrls = Array.isArray(first?.backup_url) ? first.backup_url : (Array.isArray(first?.backupUrl) ? first.backupUrl : []);
+    const quality = Number(data?.quality || selectedQn || qualities[0]?.quality || 0);
+    return {
+        identity,
+        qualities,
+        stream: primaryUrl ? {
+            quality,
+            desc: pickBiliQualityDesc(quality, acceptQuality, acceptDescription),
+            url: primaryUrl,
+            urls: [primaryUrl, ...backupUrls.map(normalizeBiliUrl)].filter(Boolean),
+            format: String(data?.format || "mp4").trim() || "mp4",
+            type: "MP4_COMPAT"
+        } : null
+    };
+}
+
+function buildCompatAudioPayload(data, identity) {
+    const audioList = Array.isArray(data?.dash?.audio) ? data.dash.audio : [];
+    const streams = audioList
+        .map((item) => {
+            const primaryUrl = normalizeBiliUrl(item?.baseUrl || item?.base_url || item?.url || "");
+            const backupUrls = Array.isArray(item?.backupUrl) ? item.backupUrl : (Array.isArray(item?.backup_url) ? item.backup_url : []);
+            const bandwidth = Number(item?.bandwidth || 0);
+            return {
+                id: Number(item?.id || 0),
+                desc: bandwidth ? `${Math.round(bandwidth / 1000)}kbps` : (item?.id ? `Audio ${item.id}` : "音频"),
+                url: primaryUrl,
+                urls: [primaryUrl, ...backupUrls.map(normalizeBiliUrl)].filter(Boolean),
+                bandwidth,
+                codecName: "m4a",
+                type: "DASH_AUDIO_COMPAT"
+            };
+        })
+        .filter((item) => item.url)
+        .sort((a, b) => Number(b.bandwidth || 0) - Number(a.bandwidth || 0));
+    return { identity, streams };
+}
+
+async function getCompatPlayUrlForTab(tabId, payload = {}) {
+    const type = String(payload?.type || "video") === "audio" ? "audio" : "video";
+    const qn = Number(payload?.qn || 0);
+    const identity = await getCurrentBiliVideoIdentity(tabId, payload);
+    const data = await fetchBiliPlayUrl(identity, {
+        fnval: type === "audio" ? 16 : 1,
+        qn: type === "video" ? (qn || 80) : 0
+    });
+    const result = type === "audio"
+        ? buildCompatAudioPayload(data, identity)
+        : buildCompatVideoPayload(data, identity, qn);
+    logDownload.info("download_compat_playurl_success", {
+        task: "download",
+        bvid: identity.bvid,
+        detail: {
+            type,
+            qn: type === "video" ? Number(qn || data?.quality || 0) : 0,
+            cid: identity.cid,
+            has_stream: type === "video" ? !!result.stream?.url : Array.isArray(result.streams) && result.streams.length > 0,
+            quality_count: Array.isArray(result.qualities) ? result.qualities.length : 0,
+            audio_stream_count: Array.isArray(result.streams) ? result.streams.length : 0
+        }
+    });
+    return { ok: true, type, ...result };
 }
 
 async function ensureDownloadHeaderRule(url) {
@@ -704,6 +1004,8 @@ class ContentProvider {
         const groqModel = String(normalizedSettings.groqModel || "").trim() || "whisper-large-v3-turbo";
         const startedAt = Date.now();
         if (!groqApiKey) throw new Error("请先在设置中填写 Groq API Key");
+        const asrRunId = String(payload?.asrRunId || `asr_${bvid}_${startedAt.toString(36)}`).trim();
+        const payloadAudioSummary = await summarizeMediaLocator(payload?.audioUrl || "");
         try {
             logASR.info("asr_start", {
                 bvid,
@@ -711,9 +1013,11 @@ class ContentProvider {
                 provider: "groq",
                 model: groqModel,
                 detail: {
+                    run_id: asrRunId,
                     tab_id: tabId,
                     cid: Number.isFinite(cid) ? cid : 0,
-                    has_payload_audio_url: !!payload?.audioUrl
+                    has_payload_audio_locator: !!payload?.audioUrl,
+                    ...payloadAudioSummary
                 }
             });
             await updateTabState(tabId, {
@@ -724,11 +1028,50 @@ class ContentProvider {
             await notifyTranscribeStatus(tabId, { stage: "start", level: "info", text: "检测到无字幕，正在转录音轨...", progress: 5, bvid });
             const media = await this.extractAudioSourceFromTab(tabId, payload);
             if (!media?.url) throw new Error("未提取到音轨地址，可能是付费视频、CDN 限制或页面未完成加载");
+            const mediaSummary = await summarizeMediaLocator(media.url);
+            const mediaPageBvid = normalizeBvid(media?.pageBvid || "");
+            logASR.info("asr_audio_source_selected", {
+                bvid,
+                task: "asr",
+                provider: "groq",
+                model: groqModel,
+                detail: {
+                    run_id: asrRunId,
+                    tab_id: tabId,
+                    media_source: String(media?.source || ""),
+                    media_page_bvid: mediaPageBvid,
+                    expected_bvid: bvid,
+                    source_bvid_matched: !mediaPageBvid || mediaPageBvid === bvid,
+                    ...mediaSummary
+                }
+            });
+            if (mediaPageBvid && mediaPageBvid !== bvid) {
+                logASR.warn("asr_audio_source_bvid_mismatch", {
+                    bvid,
+                    task: "asr",
+                    provider: "groq",
+                    model: groqModel,
+                    code: "ASR_AUDIO_SOURCE_BVID_MISMATCH",
+                    detail: {
+                        run_id: asrRunId,
+                        media_page_bvid: mediaPageBvid,
+                        expected_bvid: bvid,
+                        media_source: String(media?.source || "")
+                    }
+                });
+            }
             await updateTabState(tabId, { transcriptionProgress: 20, updatedAt: Date.now() });
             await notifyTranscribeStatus(tabId, { stage: "download", level: "info", text: "正在下载音轨...", progress: 20, bvid });
             const audioFetchStartedAt = Date.now();
             const audioBlob = await this.fetchResourceToBlob(media.url, tabId, bvid);
             const audioFetchMs = Date.now() - audioFetchStartedAt;
+            const audioDigest = await summarizeAudioBlob(audioBlob);
+            assertAsrAudioNotReused(bvid, audioDigest, {
+                runId: asrRunId,
+                provider: "groq",
+                model: groqModel,
+                audioHost: getUrlMeta(media.url).host
+            });
             logASR.info("asr_audio_fetch_success", {
                 bvid,
                 task: "asr",
@@ -736,9 +1079,10 @@ class ContentProvider {
                 model: groqModel,
                 duration_ms: audioFetchMs,
                 detail: {
-                    audio_bytes: audioBlob.size || 0,
-                    audio_type: audioBlob.type || "",
-                    url_host: getUrlMeta(media.url).host
+                    run_id: asrRunId,
+                    media_source: String(media?.source || ""),
+                    ...audioDigest,
+                    audio_host: getUrlMeta(media.url).host
                 }
             });
             if (audioBlob.size >= GROQ_MAX_AUDIO_BYTES) {
@@ -780,7 +1124,9 @@ class ContentProvider {
                     model: groqModel,
                     duration_ms: Date.now() - asrRequestStartedAt,
                     detail: {
+                        run_id: asrRunId,
                         audio_bytes: audioBlob.size || 0,
+                        audio_sha256: audioDigest.audio_sha256,
                         quota: buildGroqQuotaLine(transcription.quota)
                     }
                 });
@@ -816,8 +1162,10 @@ class ContentProvider {
                 model: groqModel,
                 duration_ms: Date.now() - startedAt,
                 detail: {
+                    run_id: asrRunId,
                     rows: rows.length,
-                    audio_bytes: audioBlob.size || 0
+                    audio_bytes: audioBlob.size || 0,
+                    audio_sha256: audioDigest.audio_sha256
                 }
             });
             await reportFeatureUsage("transcribe", bvid, normalizedSettings, {
@@ -840,6 +1188,7 @@ class ContentProvider {
                 model: groqModel,
                 duration_ms: Date.now() - startedAt,
                 detail: {
+                    run_id: asrRunId,
                     tab_id: tabId,
                     cid: Number.isFinite(cid) ? cid : 0
                 }
@@ -849,10 +1198,57 @@ class ContentProvider {
     }
 
     static async extractAudioSourceFromTab(tabId, payload) {
-        // 优先使用 content.js 传来的最新音频地址（已由 XHR hook 更新，保证是当前视频）
+        // 优先按当前 tab 的 aid/cid 主动请求 B 站 playurl，避免 SPA 页面缓存音频串线。
+        try {
+            const result = await getCompatPlayUrlForTab(tabId, {
+                ...payload,
+                type: "audio"
+            });
+            const expectedBvid = normalizeBvid(payload?.bvid || "");
+            const identityBvid = normalizeBvid(result?.identity?.bvid || "");
+            const audio = Array.isArray(result?.streams) ? result.streams[0] : null;
+            if (audio?.url && (!expectedBvid || !identityBvid || expectedBvid === identityBvid)) {
+                return {
+                    url: audio.url,
+                    urls: audio.urls,
+                    title: String(result?.identity?.title || payload?.title || "").trim(),
+                    source: "playurl_api_audio",
+                    pageBvid: identityBvid || expectedBvid
+                };
+            }
+            if (expectedBvid && identityBvid && expectedBvid !== identityBvid) {
+                logASR.warn("asr_playurl_identity_mismatch", {
+                    bvid: expectedBvid,
+                    task: "asr",
+                    provider: "groq",
+                    code: "ASR_PLAYURL_IDENTITY_MISMATCH",
+                    detail: {
+                        playurl_bvid: identityBvid,
+                        expected_bvid: expectedBvid
+                    }
+                });
+            }
+        } catch (error) {
+            logASR.warn("asr_playurl_audio_fetch_failed", {
+                bvid: normalizeBvid(payload?.bvid || ""),
+                task: "asr",
+                provider: "groq",
+                code: error?.code || "ASR_PLAYURL_AUDIO_FETCH_FAILED",
+                detail: {
+                    reason: error?.message || "playurl audio fetch failed"
+                }
+            });
+        }
+
+        // 降级使用 content.js 传来的音频地址。
         if (payload?.audioUrl) {
             const title = String(payload.title || "").trim();
-            return { url: payload.audioUrl, title };
+            return {
+                url: payload.audioUrl,
+                title,
+                source: "content_payload",
+                pageBvid: normalizeBvid(payload?.bvid || "")
+            };
         }
         // 降级：executeScript 读 __playinfo__（兜底，SPA 下可能是旧视频数据）
         const results = await chrome.scripting.executeScript({
@@ -865,9 +1261,12 @@ class ContentProvider {
                 const audioList = Array.isArray(dash?.audio) ? dash.audio : [];
                 const first = audioList.find((item) => item?.baseUrl || item?.base_url) || audioList[0] || null;
                 const title = String(document?.title || "").replace(/_哔哩哔哩_bilibili\s*$/i, "").trim();
+                const match = String(location?.href || "").match(/\/video\/(BV[a-zA-Z0-9]+)/i);
                 return {
                     url: first?.baseUrl || first?.base_url || "",
-                    title
+                    title,
+                    source: "main_world_playinfo",
+                    pageBvid: match ? match[1] : ""
                 };
             }
         });
@@ -889,6 +1288,20 @@ class ContentProvider {
             throw createAppError("DOWNLOAD_FAILED", `资源下载失败：HTTP ${response.status}`, { status: response.status });
         }
         const total = Number(response.headers.get("content-length") || 0);
+        const responseLocator = await summarizeMediaLocator(response.url || url);
+        logASR.info("asr_audio_response_headers", {
+            bvid,
+            task: "asr",
+            status: response.status,
+            detail: {
+                tab_id: tabId,
+                byte_length_header: Number.isFinite(total) ? total : 0,
+                mime_header: String(response.headers.get("content-type") || ""),
+                range_supported: String(response.headers.get("accept-ranges") || ""),
+                final_audio_host: responseLocator.audio_host,
+                final_audio_path_sha256: responseLocator.audio_path_sha256
+            }
+        });
         if (!skipSizeCheck && Number.isFinite(total) && total >= GROQ_MAX_AUDIO_BYTES) {
             throw createAppError("ASR_FILE_TOO_LARGE", "该文件大小超出限制（>=24MB），目前暂不支持");
         }
@@ -1130,6 +1543,7 @@ async function handleSubtitleCaptured(tabId, payload) {
         cid: Number.isFinite(cid) ? cid : 0,
         tid,
         title: payload.title || "",
+        subtitleSource,
         rawSubtitle,
         processedSubtitle,
         rawHash,

@@ -943,7 +943,9 @@ async function loadBootstrapData() {
     }
     appState.tabId = res?.tabId || null;
     appState.tabState = res?.tabState || null;
-    appState.cache = res?.cache || null;
+    const bootstrapBvid = normalizeBvidCase(appState.tabState?.activeBvid || getBvidFromUrl(location.href) || "");
+    const bootstrapCache = res?.cache || null;
+    appState.cache = bootstrapCache && normalizeBvidCase(bootstrapCache?.bvid || "") === bootstrapBvid ? bootstrapCache : null;
     appState.settings = res?.settings || null;
     appState.providers = res?.providers || null;
     // 首次加载固定展示 CC，让用户先看到字幕检测状态
@@ -1758,10 +1760,21 @@ function bindSummaryResizeDivider(panel) {
 }
 
 function renderCC(panel, rowsOverride) {
-    const rows = Array.isArray(rowsOverride) ? rowsOverride : (Array.isArray(appState.cache?.rawSubtitle) ? appState.cache.rawSubtitle : []);
     const currentBvid = normalizeBvidCase(appState.tabState?.activeBvid || getBvidFromUrl(location.href) || "");
     const cacheBvid = normalizeBvidCase(appState.cache?.bvid || "");
     const cacheReadyForCurrent = !!currentBvid && cacheBvid === currentBvid;
+    const rows = Array.isArray(rowsOverride) ? rowsOverride : (cacheReadyForCurrent && Array.isArray(appState.cache?.rawSubtitle) ? appState.cache.rawSubtitle : []);
+    if (!Array.isArray(rowsOverride) && cacheBvid && currentBvid && cacheBvid !== currentBvid) {
+        logContent.warn("cc_cache_mismatch_drop", {
+            task: "subtitle",
+            bvid: currentBvid,
+            code: "CC_CACHE_BVID_MISMATCH",
+            detail: {
+                cache_bvid: cacheBvid,
+                row_count: Array.isArray(appState.cache?.rawSubtitle) ? appState.cache.rawSubtitle.length : 0
+            }
+        });
+    }
     const subtitleSource = String(appState.tabState?.subtitleSource || "");
     const transcription = getTranscriptionState();
     const progress = Math.max(0, Math.min(100, Number(appState.tabState?.transcriptionProgress ?? transcription.progress ?? 0)));
@@ -4403,12 +4416,19 @@ async function startTranscriptionFromCapsule() {
         showToast("正在转录中，请稍候...");
         return;
     }
+    const asrRunId = `asr_${bvid}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 7)}`;
+    const preparedAudioUrl = appState.playInfo?.audio?.[0]?.url || "";
     logContent.info("asr_start_clicked", {
         task: "asr",
         bvid,
         detail: {
+            run_id: asrRunId,
             cid: Number(meta?.cid || 0),
-            has_audio_url: !!appState.playInfo?.audio?.[0]?.url
+            route_bvid: normalizeBvidCase(getBvidFromUrl(location.href) || ""),
+            inject_bvid: injectBvid,
+            playinfo_bvid: normalizeBvidCase(appState.playInfo?._bvid || ""),
+            has_audio_locator: !!preparedAudioUrl,
+            ...summarizeMediaLocator(preparedAudioUrl)
         }
     });
     patchTranscriptionState({
@@ -4421,10 +4441,23 @@ async function startTranscriptionFromCapsule() {
     updateProgress(10, progressTaskId);
     renderSubtitleTimelinePanel(document.getElementById("panel-body"));
     try {
-        const audioUrl = appState.playInfo?.audio?.[0]?.url || "";
+        const freshPlayInfo = await ensureAsrPlayInfoForBvid(bvid).catch(() => null);
+        const audioUrl = freshPlayInfo?.audio?.[0]?.url || "";
+        logContent.info("asr_audio_payload_selected", {
+            task: "asr",
+            bvid,
+            detail: {
+                run_id: asrRunId,
+                playinfo_bvid: normalizeBvidCase(freshPlayInfo?._bvid || appState.playInfo?._bvid || ""),
+                playinfo_source: String(freshPlayInfo?._source || appState.playInfo?._source || ""),
+                playinfo_age_ms: Math.max(0, Date.now() - Number(freshPlayInfo?._ts || appState.playInfo?._ts || 0)),
+                has_audio_locator: !!audioUrl,
+                ...summarizeMediaLocator(audioUrl)
+            }
+        });
         const res = await chrome.runtime.sendMessage({
             action: "GET_AUDIO_URL",
-            payload: { ...meta, audioUrl }
+            payload: { ...meta, audioUrl, asrRunId }
         });
         if (!res?.ok) throw new Error(res?.error || "Groq 转录失败");
     } catch (error) {
@@ -4483,10 +4516,26 @@ async function handleRegenerateGroqSubtitle() {
     };
     try {
         await chrome.runtime.sendMessage({ action: "CLEAR_SUBTITLE_CACHE", bvid: injectBvid });
-        const audioUrl = appState.playInfo?.audio?.[0]?.url || "";
+        const freshPlayInfo = await ensureAsrPlayInfoForBvid(injectBvid).catch(() => null);
+        const audioUrl = freshPlayInfo?.audio?.[0]?.url || "";
+        const asrRunId = `asr_${injectBvid}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 7)}`;
+        logContent.info("asr_regenerate_payload_prepared", {
+            task: "asr",
+            bvid: injectBvid,
+            detail: {
+                run_id: asrRunId,
+                route_bvid: normalizeBvidCase(getBvidFromUrl(location.href) || ""),
+                inject_bvid: injectBvid,
+                playinfo_bvid: normalizeBvidCase(freshPlayInfo?._bvid || appState.playInfo?._bvid || ""),
+                playinfo_source: String(freshPlayInfo?._source || appState.playInfo?._source || ""),
+                playinfo_age_ms: Math.max(0, Date.now() - Number(freshPlayInfo?._ts || appState.playInfo?._ts || 0)),
+                has_audio_locator: !!audioUrl,
+                ...summarizeMediaLocator(audioUrl)
+            }
+        });
         const res = await chrome.runtime.sendMessage({
             action: "GET_AUDIO_URL",
-            payload: { ...payload, audioUrl }
+            payload: { ...payload, audioUrl, asrRunId }
         });
         if (!res?.ok) throw new Error(res?.error || "重新生成失败");
     } catch (error) {
@@ -4572,6 +4621,38 @@ function resolveCid() {
 
 function resolveCurrentBvid() {
     return resolveCurrentBvidFromState(appState, location.href);
+}
+
+function makeShortDigest(value) {
+    const text = String(value || "");
+    let hash = 2166136261;
+    for (let i = 0; i < text.length; i++) {
+        hash ^= text.charCodeAt(i);
+        hash = Math.imul(hash, 16777619);
+    }
+    return (hash >>> 0).toString(16).padStart(8, "0");
+}
+
+function summarizeMediaLocator(locator) {
+    const raw = String(locator || "").trim();
+    if (!raw) return { audio_host: "", audio_path_hash: "", audio_query_key_count: 0 };
+    try {
+        const parsed = new URL(raw);
+        const queryKeys = [...parsed.searchParams.keys()].sort();
+        return {
+            audio_host: parsed.host || "",
+            audio_path_hash: makeShortDigest(`${parsed.pathname || ""}?${parsed.search || ""}`),
+            audio_query_key_count: queryKeys.length,
+            audio_query_keys_hash: makeShortDigest(queryKeys.join("|"))
+        };
+    } catch (_) {
+        return {
+            audio_host: "",
+            audio_path_hash: makeShortDigest(raw),
+            audio_query_key_count: 0,
+            audio_query_keys_hash: ""
+        };
+    }
 }
 
 function onGlobalShortcut(event) {
@@ -4971,6 +5052,37 @@ async function waitForAlignedPlayInfo(targetBvid) {
     return null;
 }
 
+function isAsrPlayInfoFreshForBvid(info, targetBvid, maxAgeMs = 30000) {
+    const expectedBvid = normalizeBvidCase(targetBvid || "");
+    const normalized = normalizeIncomingPlayInfo(info);
+    if (!hasUsablePlayInfoForBvid(normalized, expectedBvid)) return false;
+    return true;
+}
+
+async function ensureAsrPlayInfoForBvid(targetBvid) {
+    const expectedBvid = normalizeBvidCase(targetBvid || "");
+    if (!expectedBvid) return null;
+    if (isAsrPlayInfoFreshForBvid(appState.playInfo, expectedBvid)) {
+        return appState.playInfo;
+    }
+    clearStreamCache();
+    const fresh = await waitForAlignedPlayInfo(expectedBvid);
+    if (isAsrPlayInfoFreshForBvid(fresh, expectedBvid)) {
+        return fresh;
+    }
+    logContent.warn("asr_playinfo_not_fresh", {
+        task: "asr",
+        bvid: expectedBvid,
+        code: "ASR_PLAYINFO_NOT_FRESH",
+        detail: {
+            playinfo_bvid: normalizeBvidCase(fresh?._bvid || appState.playInfo?._bvid || ""),
+            playinfo_source: String(fresh?._source || appState.playInfo?._source || ""),
+            playinfo_age_ms: Math.max(0, Date.now() - Number(fresh?._ts || appState.playInfo?._ts || 0))
+        }
+    });
+    return fresh || appState.playInfo || null;
+}
+
 function scheduleSubtitleFallbackWatchdog(source) {
     if (appState.subtitleFallbackTimer) {
         clearTimeout(appState.subtitleFallbackTimer);
@@ -5044,6 +5156,14 @@ async function syncActiveCacheByBvid(expectedBvid) {
         if (normalizeBvidCase(appState.tabState?.activeBvid || "") !== target) return;
         const nextCache = res?.[`cache_${target}`] || null;
         appState.cache = nextCache && normalizeBvidCase(nextCache?.bvid || "") === target ? nextCache : null;
+        const cachedSubtitleSource = String(appState.cache?.subtitleSource || "");
+        if (cachedSubtitleSource) {
+            appState.tabState = {
+                ...(appState.tabState || {}),
+                subtitleSource: cachedSubtitleSource,
+                transcriptionProgress: cachedSubtitleSource === "groq" ? 100 : Number(appState.tabState?.transcriptionProgress || 0)
+            };
+        }
         if (Array.isArray(appState.cache?.rawSubtitle) && appState.cache.rawSubtitle.length) {
             appState.subtitleCapturedBvid = target;
             if (!isTranscriptionRunning()) {
@@ -5118,6 +5238,14 @@ async function syncCacheFromBackground(bvid, options = {}) {
         }
         appState.cache = cache;
         if (res.tabState) appState.tabState = res.tabState;
+        const cachedSubtitleSource = String(cache?.subtitleSource || "");
+        if (cachedSubtitleSource) {
+            appState.tabState = {
+                ...(appState.tabState || {}),
+                subtitleSource: cachedSubtitleSource,
+                transcriptionProgress: cachedSubtitleSource === "groq" ? 100 : Number(appState.tabState?.transcriptionProgress || 0)
+            };
+        }
         appState.subtitleCapturedBvid = target;
         reconcileTranscriptionState(target);
         appState.isStateDirty = false;
@@ -5267,7 +5395,8 @@ function onBackgroundMessage(message) {
     if (cache && payloadBvid && normalizeBvidCase(cache?.bvid || "") !== payloadBvid) return false;
     appState.pendingSubtitle = null;
     renderNav();
-    appState.cache = cache && (!routeBvid || String(cache?.bvid || "").trim() === routeBvid) ? cache : null;
+    const messageCacheBvid = normalizeBvidCase(cache?.bvid || "");
+    appState.cache = cache && (!routeBvid || messageCacheBvid === routeBvid) ? cache : null;
     if (cache?.rawSubtitle?.length) {
         reconcileTranscriptionState(payloadBvid || routeBvid);
     }
@@ -5461,8 +5590,8 @@ function renderExportMainMenu(menuContainer) {
     const downloadVideoLabel = "下载视频";
     const downloadAudioLabel = "下载音频";
     menuContainer.innerHTML = `
-        <button type="button" class="copy-option-btn" data-action="download-video" style="opacity:${downloadReady ? "1" : "0.72"}">${downloadVideoLabel}</button>
-        <button type="button" class="copy-option-btn" data-action="download-audio" style="opacity:${downloadReady ? "1" : "0.72"}">${downloadAudioLabel}</button>
+        <button type="button" class="copy-option-btn" data-action="download-video">${downloadVideoLabel}</button>
+        <button type="button" class="copy-option-btn" data-action="download-audio">${downloadAudioLabel}</button>
         <div class="menu-divider" style="height:1px;background:#eee;margin:4px 0;"></div>
         <button type="button" class="copy-option-btn" data-action="export-srt">导出字幕 (SRT)</button>
     `;
@@ -5474,30 +5603,12 @@ function renderExportMainMenu(menuContainer) {
     
     menuContainer.querySelector('[data-action="download-video"]').addEventListener("click", async (e) => {
         e.stopPropagation();
-        if (!appState.isPlayInfoReady) {
-            renderExportLoadingState(menuContainer, "video");
-            const info = await refreshPlayInfoNow(7000).catch(() => null);
-            if (!hasUsablePlayInfoForBvid(info, getBvidFromUrl(location.href) || "")) {
-                showToast("暂未拿到可用视频流，请稍后重试");
-                renderExportMainMenu(menuContainer);
-                return;
-            }
-        }
-        renderQualityList(menuContainer, "video");
+        await renderCompatQualityList(menuContainer, "video");
     });
-    
+
     menuContainer.querySelector('[data-action="download-audio"]').addEventListener("click", async (e) => {
         e.stopPropagation();
-        if (!appState.isPlayInfoReady) {
-            renderExportLoadingState(menuContainer, "audio");
-            const info = await refreshPlayInfoNow(7000).catch(() => null);
-            if (!hasUsablePlayInfoForBvid(info, getBvidFromUrl(location.href) || "")) {
-                showToast("暂未拿到可用音频流，请稍后重试");
-                renderExportMainMenu(menuContainer);
-                return;
-            }
-        }
-        renderQualityList(menuContainer, "audio");
+        await renderCompatQualityList(menuContainer, "audio");
     });
 }
 
@@ -5525,6 +5636,171 @@ async function pickVerifiedDownloadUrl(stream) {
         if (status === "ok") return url;
     }
     return "";
+}
+
+function buildCompatIdentityPayload(type, qn) {
+    return {
+        type,
+        qn: Number(qn || 0) || undefined,
+        bvid: normalizeBvidCase(resolveCurrentBvid() || getBvidFromUrl(location.href) || ""),
+        cid: Number(resolveCid() || appState.injectCid || appState.tabState?.activeCid || 0),
+        tid: appState.tabState?.activeTid || getTidFromUrl(location.href),
+        title: cleanBilibiliTitle(document.title)
+    };
+}
+
+async function fetchCompatPlayUrl(type, qn = 0) {
+    const response = await chrome.runtime.sendMessage({
+        action: "GET_COMPAT_PLAYURL",
+        payload: buildCompatIdentityPayload(type, qn)
+    });
+    if (!response?.ok) throw new Error(response?.error || "获取兼容下载链接失败");
+    return response;
+}
+
+async function renderCompatQualityList(menuContainer, type) {
+    if (!menuContainer) return;
+    if (!chrome.runtime?.id) {
+        showToast("下载链接已经失效，请刷新页面后重试");
+        return;
+    }
+    renderExportLoadingState(menuContainer, type);
+    const pageBvid = normalizeBvidCase(getBvidFromUrl(location.href) || "");
+    let compat;
+    try {
+        compat = await fetchCompatPlayUrl(type);
+    } catch (error) {
+        logDownload.error("download_compat_playurl_failed", {
+            task: "download",
+            bvid: pageBvid,
+            code: error?.code || "DOWNLOAD_COMPAT_PLAYURL_FAILED",
+            detail: { type, reason: error?.message || "获取兼容下载链接失败" }
+        });
+        notifyMappedError(error, "获取兼容下载链接失败: " + (error.message || ""));
+        renderExportMainMenu(menuContainer);
+        return;
+    }
+    const title = type === "video" ? "选择清晰度" : "选择音频";
+    const bodyHtml = type === "video"
+        ? (Array.isArray(compat.qualities) ? compat.qualities : []).map((item) => `
+            <div class="quality-item" style="display:flex;align-items:center;justify-content:space-between;padding:8px 12px;gap:12px;border-bottom:1px solid #f1f2f3;">
+                <span class="quality-desc" style="font-size:13px;">${escapeHtml(item.desc || "")}</span>
+                <button class="compat-video-download-btn" data-qn="${Number(item.quality || 0)}"
+                   style="font-size:12px;padding:4px 10px;border:1px solid #fb7299;color:#fff;background:#fb7299;border-radius:4px;cursor:pointer;">
+                   下载
+                </button>
+            </div>
+        `).join("")
+        : (Array.isArray(compat.streams) ? compat.streams : []).map((item, index) => `
+            <div class="quality-item" style="display:flex;align-items:center;justify-content:space-between;padding:8px 12px;gap:12px;border-bottom:1px solid #f1f2f3;">
+                <span class="quality-desc" style="font-size:13px;">${escapeHtml(item.desc || "音频")}</span>
+                <button class="compat-audio-download-btn" data-index="${index}"
+                   style="font-size:12px;padding:4px 10px;border:1px solid #fb7299;color:#fff;background:#fb7299;border-radius:4px;cursor:pointer;">
+                   下载
+                </button>
+            </div>
+        `).join("");
+
+    if (!bodyHtml) {
+        showToast(type === "video" ? "未找到兼容视频流" : "未找到可用音频流");
+        renderExportMainMenu(menuContainer);
+        return;
+    }
+
+    menuContainer.innerHTML = `
+        <div class="quality-list-header" style="display:flex;align-items:center;gap:8px;padding:8px 12px;border-bottom:1px solid #eee;margin-bottom:4px;">
+            <button class="back-btn" style="border:none;background:none;cursor:pointer;font-size:16px;padding:0 4px;">←</button>
+            <span style="font-size:13px;font-weight:600;">${title}</span>
+            <span style="font-size:11px;color:#9499a0;">兼容模式</span>
+        </div>
+        <div class="quality-list-body" style="max-height:300px;overflow-y:auto;padding-top:4px;">
+            ${bodyHtml}
+        </div>
+    `;
+    menuContainer.querySelector(".back-btn")?.addEventListener("click", (e) => {
+        e.stopPropagation();
+        renderExportMainMenu(menuContainer);
+    });
+
+    menuContainer.querySelectorAll(".compat-video-download-btn").forEach((btn) => {
+        btn.addEventListener("click", async (event) => {
+            event.stopPropagation();
+            const qn = Number(btn.dataset.qn || 0);
+            const originalText = btn.textContent;
+            btn.textContent = "准备中...";
+            btn.disabled = true;
+            try {
+                const startedAt = Date.now();
+                const fresh = await fetchCompatPlayUrl("video", qn);
+                const stream = fresh?.stream || null;
+                if (!stream?.url) throw new Error("未获取到该清晰度的 MP4 下载链接");
+                const urlToDownload = await pickVerifiedDownloadUrl(stream) || stream.url;
+                const safeTitle = sanitizeDownloadFileName(cleanBilibiliTitle(document.title));
+                const filename = `${safeTitle}_${stream.desc || qn}_兼容.mp4`;
+                logDownload.info("download_url_prepare_success", {
+                    task: "download",
+                    bvid: pageBvid,
+                    duration_ms: Date.now() - startedAt,
+                    detail: {
+                        asset_type: "video",
+                        download_mode: "compat_mp4",
+                        quality: stream.desc || "",
+                        quality_id: Number(stream.quality || qn || 0),
+                        has_url: !!urlToDownload,
+                        file_ext: "mp4"
+                    }
+                });
+                await chrome.runtime.sendMessage({
+                    action: "DOWNLOAD_STREAM",
+                    payload: { url: urlToDownload, filename }
+                });
+                showToast("下载已触发，请查看浏览器下载");
+            } catch (error) {
+                logDownload.error("download_url_prepare_failed", {
+                    task: "download",
+                    bvid: pageBvid,
+                    code: error?.code || "DOWNLOAD_COMPAT_FAILED",
+                    detail: {
+                        asset_type: "video",
+                        download_mode: "compat_mp4",
+                        quality_id: qn,
+                        reason: error.message || "下载失败"
+                    }
+                });
+                notifyMappedError(error, "下载失败: " + (error.message || ""));
+            } finally {
+                btn.textContent = originalText;
+                btn.disabled = false;
+            }
+        });
+    });
+
+    menuContainer.querySelectorAll(".compat-audio-download-btn").forEach((btn) => {
+        btn.addEventListener("click", async (event) => {
+            event.stopPropagation();
+            const index = Number(btn.dataset.index || 0);
+            const stream = Array.isArray(compat.streams) ? compat.streams[index] : null;
+            if (!stream?.url) return;
+            const originalText = btn.textContent;
+            btn.textContent = "准备中...";
+            btn.disabled = true;
+            try {
+                const urlToDownload = await pickVerifiedDownloadUrl(stream) || stream.url;
+                const safeTitle = sanitizeDownloadFileName(cleanBilibiliTitle(document.title));
+                const filename = `${safeTitle}_${stream.desc || "音频"}.m4a`;
+                await chrome.runtime.sendMessage({
+                    action: "DOWNLOAD_STREAM",
+                    payload: { url: urlToDownload, filename }
+                });
+                showToast("下载已触发，请查看浏览器下载");
+            } catch (error) {
+                notifyMappedError(error, "下载失败: " + (error.message || ""));
+            } finally {
+                btn.textContent = originalText;
+                btn.disabled = false;
+            }
+        });
+    });
 }
 
 function renderQualityList(menuContainer, type) {
@@ -5561,6 +5837,15 @@ function renderQualityList(menuContainer, type) {
     }
     
     const title = type === "video" ? "选择清晰度" : "选择音频";
+    const qualityTipHtml = type === "video" ? `
+            <span class="download-quality-info" aria-label="下载提示" tabindex="0"
+                  style="position:relative;display:inline-flex;align-items:center;justify-content:center;width:16px;height:16px;border:1px solid #c9ccd0;border-radius:50%;color:#9499a0;font-size:12px;line-height:1;cursor:help;">
+                i
+                <span class="download-quality-tooltip"
+                      style="display:none;position:absolute;left:50%;top:22px;transform:translateX(-50%);z-index:10000;width:220px;padding:8px 10px;border-radius:6px;background:#2f3238;color:#fff;font-size:12px;font-weight:400;line-height:1.45;box-shadow:0 6px 18px rgba(0,0,0,0.16);">
+                    请检查下载文件后缀，如为.htm请尝试其他编码或清晰度！
+                </span>
+            </span>` : "";
     
     // For video, streams are now grouped: { quality, desc, streams: [{codecName, url...}] }
     // For audio, it's still a flat array (unless we group audio too, but inject.js didn't change audio structure much)
@@ -5613,6 +5898,7 @@ function renderQualityList(menuContainer, type) {
         <div class="quality-list-header" style="display:flex;align-items:center;gap:8px;padding:8px 12px;border-bottom:1px solid #eee;margin-bottom:4px;">
             <button class="back-btn" style="border:none;background:none;cursor:pointer;font-size:16px;padding:0 4px;">←</button>
             <span style="font-size:13px;font-weight:600;">${title}</span>
+            ${qualityTipHtml}
         </div>
         <div class="quality-list-body" style="max-height:300px;overflow-y:auto;padding-top:4px;">
             <div class="download-unavailable-notice" style="display:none;margin:0 10px 8px;padding:8px 10px;border:1px solid #ffd7e5;background:#fff5f8;color:#8a4158;border-radius:6px;font-size:12px;line-height:1.45;">
@@ -5628,6 +5914,16 @@ function renderQualityList(menuContainer, type) {
         e.stopPropagation();
         renderExportMainMenu(menuContainer);
     });
+    const qualityInfo = menuContainer.querySelector(".download-quality-info");
+    const qualityTooltip = qualityInfo?.querySelector(".download-quality-tooltip");
+    if (qualityInfo && qualityTooltip) {
+        const showQualityTip = () => { qualityTooltip.style.display = "block"; };
+        const hideQualityTip = () => { qualityTooltip.style.display = "none"; };
+        qualityInfo.addEventListener("mouseenter", showQualityTip);
+        qualityInfo.addEventListener("mouseleave", hideQualityTip);
+        qualityInfo.addEventListener("focus", showQualityTip);
+        qualityInfo.addEventListener("blur", hideQualityTip);
+    }
     menuContainer.querySelector('[data-action="download-retry-streams"]')?.addEventListener("click", async (e) => {
         e.stopPropagation();
         menuContainer.dataset.expiredRefreshAttempted = "";
@@ -6122,6 +6418,7 @@ async function refreshPlayInfoNow(timeoutMs = 7000) {
                     duration_ms: Date.now() - startWait,
                     detail: {
                         source: "inject_bridge",
+                        playinfo_source: String(appState.playInfo?._source || ""),
                         video_stream_count: Array.isArray(appState.playInfo?.video) ? appState.playInfo.video.length : 0,
                         audio_stream_count: Array.isArray(appState.playInfo?.audio) ? appState.playInfo.audio.length : 0
                     }
@@ -6139,6 +6436,7 @@ async function refreshPlayInfoNow(timeoutMs = 7000) {
             bvid: pageBvid,
             detail: {
                 source: "playinfo",
+                playinfo_source: String(appState.playInfo?._source || ""),
                 video_group_count: Array.isArray(appState.playInfo?.video) ? appState.playInfo.video.length : 0,
                 audio_stream_count: Array.isArray(appState.playInfo?.audio) ? appState.playInfo.audio.length : 0
             }
