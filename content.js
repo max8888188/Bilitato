@@ -140,6 +140,7 @@ const appState = {
     },
     transcriptionDeclinedBvid: "",
     transcriptionSuppressUntil: 0,
+    transcriptionSuppressBvid: "",
     transcribeCountdownTimer: null,
     subtitleCheckDelayTimer: null,
     subtitleDetectTimeoutTimer: null,
@@ -155,6 +156,7 @@ const appState = {
     injectBvidChangedAt: Date.now(),
     progressTaskId: "",
     progressLastTick: 0,
+    progressLastPercent: 0,
     progressTimeoutTimer: null,
     progressResetTimer: null,
     progressFadeTimer: null,
@@ -866,6 +868,8 @@ function scheduleProgressFadeOut(taskId) {
             bar.style.transition = "";
             appState.progressTaskId = "";
             appState.progressLastTick = 0;
+            appState.progressLastPercent = 0;
+            
         }, 520);
     }, 2000);
 }
@@ -873,48 +877,89 @@ function scheduleProgressFadeOut(taskId) {
 function updateProgress(percent, taskId, options) {
     const bar = panelShadowRoot ? panelShadowRoot.getElementById("step-progress-bar") : null;
     if (!bar) return;
+
     const opts = options && typeof options === "object" ? options : {};
     const nextTaskId = String(taskId || "global");
-    const clamped = Math.max(0, Math.min(100, Number(percent) || 0));
+
+    let clamped = Math.max(0, Math.min(100, Number(percent) || 0));
+
     const hasActiveTask = !!appState.progressTaskId;
+    const sameTask = appState.progressTaskId === nextTaskId;
+
+    // 核心修复：同一个任务进行中，进度只允许前进，不允许回退
+    // 例如 Groq 可能回传 10 → 45 → 30 → 70
+    // UI 应该显示为 10 → 45 → 45 → 70
+    if (
+        sameTask &&
+        !opts.force &&
+        !opts.error &&
+        clamped > 0 &&
+        clamped < 100 &&
+        Number(appState.progressLastPercent || 0) > clamped
+    ) {
+        clamped = Number(appState.progressLastPercent || clamped);
+    }
+
+    // 记录当前任务的最大进度
+    appState.progressTaskId = nextTaskId;
+    appState.progressLastPercent = clamped;
+    appState.progressLastTick = Date.now();
+
     if (appState.pseudoProgressTaskId && appState.pseudoProgressTaskId !== nextTaskId) {
         clearPseudoProgressTicker();
         appState.pseudoProgressTaskId = "";
         appState.pseudoProgressValue = 0;
         appState.pseudoProgressStartedAt = 0;
     }
+
     if (hasActiveTask && appState.progressTaskId !== nextTaskId) {
         resetStepProgressBar(bar);
+        appState.progressLastPercent = 0;
     }
+
     clearStepProgressTimers();
+
     if (clamped <= 0) {
         if (!opts.force && hasActiveTask && appState.progressTaskId !== nextTaskId) return;
+
         resetStepProgressBar(bar);
         appState.progressTaskId = "";
         appState.progressLastTick = 0;
+        appState.progressLastPercent = 0;
         return;
     }
+
     appState.progressTaskId = nextTaskId;
     appState.progressLastTick = Date.now();
+
     bar.classList.remove("error");
     bar.style.opacity = "1";
     bar.style.transform = `scaleX(${clamped / 100})`;
+
     if (opts.error) {
         bar.classList.remove("loading");
         bar.classList.add("error");
         scheduleProgressFadeOut(nextTaskId);
         return;
     }
+
     if (clamped < 100) {
         bar.classList.add("loading");
         scheduleStepProgressTimeout(nextTaskId);
         return;
     }
+
     bar.classList.remove("loading");
     scheduleProgressFadeOut(nextTaskId);
 }
 
+
 function syncStepProgressByTaskState(tabState) {
+    const currentBvid = normalizeBvidCase(resolveCurrentBvid() || "");
+    const stateBvid = normalizeBvidCase(tabState?.activeBvid || "");
+    
+    if (currentBvid && stateBvid && currentBvid !== stateBvid) return;
+    
     if (String(appState.progressTaskId || "").startsWith("transcribe:")) return;
     const rawTaskStatus = tabState?.taskStatus || {};
     const taskStatus = Object.fromEntries(
@@ -1515,8 +1560,8 @@ function renderSummary(panel) {
     }
     const summary = appState.cache?.summary || "";
     const segments = Array.isArray(appState.cache?.segments) ? appState.cache.segments : [];
-    const summaryStatus = appState.tabState?.taskStatus?.summary || "idle";
-    const segmentsStatus = appState.tabState?.taskStatus?.segments || "idle";
+    const summaryStatus = getCurrentVideoTaskStatus("summary");
+    const segmentsStatus = getCurrentVideoTaskStatus("segments");
     const isLoading = summaryStatus === "processing" || segmentsStatus === "processing";
     const hasContent = !!String(summary || "").trim() || segments.length > 0;
 
@@ -2168,7 +2213,7 @@ function renderReal(panel) {
     }
     const rumors = appState.cache?.rumors;
     const claims = Array.isArray(rumors?.claims) ? rumors.claims : [];
-    const rumorsStatus = appState.tabState?.taskStatus?.rumors || "idle";
+    const rumorsStatus = getCurrentVideoTaskStatus("rumors");
     const hasRumorsCache = !!String(rumors?.overview || "").trim() || claims.length > 0;
     
     // Sort claims by timestamp
@@ -2189,6 +2234,31 @@ function renderReal(panel) {
     
     const isFresh = appState.sessionGeneratedTasks.has("rumors");
     const rumorsCacheTag = buildCacheTagHtml(appState.cache, ["rumors"], hasRumorsCache, rumorsStatus === "processing", isFresh);
+    if (rumorsStatus === "processing") {
+        const rumorsSkeleton = renderSkeletonLines(6, "summary-skeleton");
+        const claimsSkeleton = renderSkeletonLines(5, "segments-skeleton");
+        const refreshIconSrc = chrome.runtime.getURL(`${UI_ICON_BASE_DIR}/default/refresh.png`);
+    
+        panel.innerHTML = `
+            <div class="page-header">
+                <h3>验真助手 <div class="header-tags"><span class="beta-tag">Beta</span>${rumorsCacheTag}</div></h3>
+                <div class="summary-header-actions" style="display:flex;gap:6px;">
+                    <button class="panel-icon-btn" disabled>
+                        <img src="${refreshIconSrc}" style="width:16px;height:16px;object-fit:contain;transform:scale(0.9);opacity:0.5;">
+                    </button>
+                </div>
+            </div>
+            <div class="page-body">
+                <div class="result-text" style="margin-bottom:12px;">
+                    ${rumorsSkeleton}
+                </div>
+                <div class="claim-list">
+                    ${claimsSkeleton}
+                </div>
+            </div>
+        `;
+        return;
+    }
 
     const claimListHtml = sortedClaims.map((item) => {
         // Determine style class based on verdict/credibility
@@ -2486,8 +2556,8 @@ function renderSettings(panel) {
     const customProtocol = String(settings.customProtocol || "openai").toLowerCase() === "claude" ? "claude" : "openai";
     const defaultOpenPage = resolveDefaultOpenPage(settings.defaultOpenPage);
     const modelScopeModelOptions = [
-        "MiniMax/MiniMax-M2.5",
         "moonshotai/Kimi-K2.5",
+        "MiniMax/MiniMax-M2.5",
         "GLM-5.1",
         "deepseek-ai/DeepSeek-V3.2",
         "Qwen3.5-27B"
@@ -3244,6 +3314,8 @@ function resetPageStateByBvidSwitch() {
     appState.cache = null;
     appState.chatPending = [];
     appState.chatStreamingId = "";
+    appState.chatActiveMessageId = "";
+    appState.sessionGeneratedTasks = new Set();
     if (appState.chatStreamTimer) {
         clearInterval(appState.chatStreamTimer);
         appState.chatStreamTimer = null;
@@ -3287,6 +3359,7 @@ function resetPageStateByBvidSwitch() {
     clearStepProgressTimers();
     clearPseudoProgressTicker();
     appState.progressTaskId = "";
+    appState.progressLastPercent = 0;
     appState.progressLastTick = 0;
     appState.pseudoProgressTaskId = "";
     appState.pseudoProgressValue = 0;
@@ -3315,6 +3388,10 @@ function resetPageStateByBvidSwitch() {
 }
 
 function resetAllState() {
+    appState.chatPending = [];
+    appState.chatStreamingId = "";
+    appState.chatActiveMessageId = "";
+    appState.sessionGeneratedTasks = new Set();
     appState.subtitleDomDetected = false;
     resetTranscriptionState();
     appState.subtitleObserveUntil = 0;
@@ -3335,6 +3412,7 @@ function resetAllState() {
     
     appState.progressTaskId = "";
     appState.progressLastTick = 0;
+    appState.progressLastPercent = 0;
     appState.pseudoProgressTaskId = "";
     appState.pseudoProgressValue = 0;
     appState.pseudoProgressStartedAt = 0;
@@ -4257,7 +4335,7 @@ function ensureSegmentsVideoEvents() {
 }
 
 function shouldHideRuntimeMetrics() {
-    const taskStatus = appState.tabState?.taskStatus || {};
+    const taskStatus = isTabStateForCurrentVideo() ? (appState.tabState?.taskStatus || {}) : {};
     const summaryRunning = taskStatus.summary === "processing";
     const segmentsRunning = taskStatus.segments === "processing";
     const rumorsRunning = taskStatus.rumors === "processing";
@@ -4459,6 +4537,10 @@ async function startTranscriptionFromCapsule() {
             ...summarizeMediaLocator(preparedAudioUrl)
         }
     });
+
+    appState.progressTaskId = "";
+    appState.progressLastPercent = 0;
+
     patchTranscriptionState({
         phase: "running",
         bvid,
@@ -4466,7 +4548,7 @@ async function startTranscriptionFromCapsule() {
         statusText: "正在请求转录..."
     });
     appState.transcriptionCapsuleVisible = true;
-    updateProgress(10, progressTaskId);
+    updateProgress(10, progressTaskId, { force: true });
     renderSubtitleTimelinePanel(document.getElementById("panel-body"));
     try {
         const freshPlayInfo = await ensureAsrPlayInfoForBvid(bvid).catch(() => null);
@@ -4529,6 +4611,9 @@ async function handleRegenerateGroqSubtitle() {
         rawHash: "",
         processedHash: ""
     };
+
+    appState.progressTaskId = "";
+    appState.progressLastPercent = 0;
     patchTranscriptionState({
         phase: "running",
         bvid: injectBvid,
@@ -4649,6 +4734,17 @@ function resolveCid() {
 
 function resolveCurrentBvid() {
     return resolveCurrentBvidFromState(appState, location.href);
+}
+
+function isTabStateForCurrentVideo() {
+    const currentBvid = normalizeBvidCase(resolveCurrentBvid() || "");
+    const stateBvid = normalizeBvidCase(appState.tabState?.activeBvid || "");
+    return !!currentBvid && !!stateBvid && currentBvid === stateBvid;
+}
+
+function getCurrentVideoTaskStatus(task) {
+    if (!isTabStateForCurrentVideo()) return "idle";
+    return appState.tabState?.taskStatus?.[task] || "idle";
 }
 
 function hasUsableSubtitleCache(cache, targetBvid = "") {
@@ -5204,7 +5300,7 @@ async function syncActiveCacheByBvid(expectedBvid) {
                 transcriptionProgress: (cachedSubtitleSource === "groq" || cachedSubtitleSource === "whisper" || cachedSubtitleSource === "siliconflow" || cachedSubtitleSource === "funasr") ? 100 : Number(appState.tabState?.transcriptionProgress || 0)
             };
         }
-        if (Array.isArray(appState.cache?.rawSubtitle) && appState.cache.rawSubtitle.length) {
+        if (hasUsableSubtitleCache(appState.cache, target)) {
             appState.subtitleCapturedBvid = target;
             if (!isTranscriptionRunning()) {
                 appState.transcriptionCapsuleVisible = false;
@@ -5217,9 +5313,7 @@ async function syncActiveCacheByBvid(expectedBvid) {
 }
 
 function hasSubtitleCacheForBvid(targetBvid) {
-    const target = normalizeBvidCase(targetBvid || "");
-    const cacheBvid = normalizeBvidCase(appState.cache?.bvid || "");
-    return !!(target && cacheBvid === target && Array.isArray(appState.cache?.rawSubtitle) && appState.cache.rawSubtitle.length);
+    return hasUsableSubtitleCache(appState.cache, targetBvid);
 }
 
 function reconcileTranscriptionState(targetBvid) {
@@ -5326,7 +5420,20 @@ function onBackgroundMessage(message) {
         return false;
     }
     if (action === "TRANSCRIBE_STATUS") {
-        const progressTaskId = `transcribe:${normalizeBvidCase(getTranscriptionBvid() || appState.injectBvid || resolveCurrentBvid() || "unknown")}`;
+        const messageBvid = normalizeBvidCase(message?.bvid || "");
+        const currentBvid = normalizeBvidCase(resolveCurrentBvid() || appState.injectBvid || "");
+
+        if (messageBvid && currentBvid && messageBvid !== currentBvid) {
+            logContent.warn("transcription_stale_message_drop", {
+            task: "asr",
+            bvid: messageBvid,
+            detail: { current_bvid: currentBvid, stage: message?.stage || "" }
+            });
+            return false;
+}
+        const activeTranscribeBvid = messageBvid || normalizeBvidCase(getTranscriptionBvid() || appState.injectBvid || currentBvid || "unknown");
+        const progressTaskId = `transcribe:${activeTranscribeBvid}`;
+
         const text = String(message?.text || "").trim();
         const quotaLine = String(message?.quotaLine || "").trim();
         const isError = message?.level === "error";
@@ -5352,7 +5459,7 @@ function onBackgroundMessage(message) {
         if (message?.stage !== "done") {
             patchTranscriptionState({
                 phase: "running",
-                bvid: normalizeBvidCase(message?.bvid || getTranscriptionBvid() || appState.injectBvid || resolveCurrentBvid() || ""),
+                bvid: activeTranscribeBvid,
                 statusText: text || getTranscriptionState().statusText
             });
         }
@@ -5397,22 +5504,22 @@ function onBackgroundMessage(message) {
                     bvid: taskBvid,
                     detail: { current_bvid: currentBvid }
                 });
-                resetTranscriptionState({ phase: "done", progress: 100 });
-                appState.transcriptionCapsuleVisible = false;
-                appState.transcriptionCapsuleMeta = null;
-                appState.isStateDirty = true;
-                updateProgress(100, progressTaskId);
-                return;
+                return false;
             }
             
             resetTranscriptionState({ phase: "done", progress: 100 });
             appState.transcriptionCapsuleVisible = false;
             appState.transcriptionCapsuleMeta = null;
             appState.isStateDirty = true;
-            updateProgress(100, progressTaskId);
+            updateProgress(95, progressTaskId);
             
             const targetBvid = normalizeBvidCase(message?.bvid || currentBvid || "");
-            syncCacheFromBackgroundWithRetry(targetBvid).then(() => renderContent());
+            syncCacheFromBackgroundWithRetry(targetBvid).then((ok) => {
+                if (ok && hasUsableSubtitleCache(appState.cache, targetBvid)) {
+                    updateProgress(100, progressTaskId);
+                }
+                renderContent();
+            });
             renderSubtitleTimelinePanel(document.getElementById("panel-body"));
         }
         if (message?.stage !== "done" && message?.level !== "error") {

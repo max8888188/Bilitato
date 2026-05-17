@@ -24,11 +24,15 @@
         HTTP_429: {
             title: "请求太频繁",
             message: "服务商返回限流或额度上限，请稍等一会儿再试。",
+            actionText: "重试",
+            action: "retry",
             presentation: "toast"
         },
         HTTP_5XX: {
             title: "模型服务暂时不可用",
             message: "服务商服务器异常，可以稍后重试，或切换 Provider。",
+            actionText: "重试",
+            action: "retry",
             presentation: "toast"
         },
         TIMEOUT: {
