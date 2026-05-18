@@ -1842,13 +1842,36 @@ function renderCC(panel, rowsOverride) {
         });
     }
     const subtitleSource = String(appState.tabState?.subtitleSource || "");
+
     const transcription = getTranscriptionState();
-    const stateProgress = Math.max(0, Math.min(100, Number(appState.tabState?.transcriptionProgress ?? 0)));
-    const localProgress = Math.max(0, Math.min(100, Number(transcription.progress ?? 0)));
-    const progress = isTranscriptionRunning() ? Math.max(stateProgress, localProgress) : Math.max(stateProgress, localProgress);
+
+    const currentBvidForProgress = normalizeBvidCase(resolveCurrentBvid() || "");
+    const tabStateBvidForProgress = normalizeBvidCase(appState.tabState?.activeBvid || "");
+    const transcriptionBvidForProgress = normalizeBvidCase(transcription.bvid || "");
+
+    const tabProgressBelongsToCurrent =
+        !!currentBvidForProgress &&
+        !!tabStateBvidForProgress &&
+        currentBvidForProgress === tabStateBvidForProgress;
+
+    const localProgressBelongsToCurrent =
+        !!currentBvidForProgress &&
+        !!transcriptionBvidForProgress &&
+        currentBvidForProgress === transcriptionBvidForProgress;
+
+    const stateProgress = tabProgressBelongsToCurrent
+        ? Math.max(0, Math.min(100, Number(appState.tabState?.transcriptionProgress ?? 0)))
+        : 0;
+
+    const localProgress = localProgressBelongsToCurrent
+        ? Math.max(0, Math.min(100, Number(transcription.progress ?? 0)))
+        : 0;
+
+    const running = isTranscriptionRunning() && localProgressBelongsToCurrent;
+    const progress = running ? Math.max(stateProgress, localProgress) : 0;
+
     const isAsrSubtitle = subtitleSource === "groq" || subtitleSource === "whisper" || subtitleSource === "siliconflow" || subtitleSource === "funasr";
     const isNoTimestampSubtitle = subtitleSource === "siliconflow" || subtitleSource === "funasr";
-    const running = isTranscriptionRunning();
     const shouldShowRegenerate = rows.length > 0 && isAsrSubtitle && !running;
 
     const sourceText = rows.length ? (isAsrSubtitle ? "ASR转录生成" : "官方AI字幕") : "未检测到字幕";
@@ -2234,6 +2257,12 @@ function renderReal(panel) {
     
     const isFresh = appState.sessionGeneratedTasks.has("rumors");
     const rumorsCacheTag = buildCacheTagHtml(appState.cache, ["rumors"], hasRumorsCache, rumorsStatus === "processing", isFresh);
+    const realNoticeHtml = `
+    <div class="real-notice">
+        提示：当前内置大模型暂无联网能力，无法对时事新闻作出实时评判；验真结果仅基于历史事实、科学常识、通用知识和视频上下文，仅供参考。
+    </div>
+    `;
+    
     if (rumorsStatus === "processing") {
         const rumorsSkeleton = renderSkeletonLines(6, "summary-skeleton");
         const claimsSkeleton = renderSkeletonLines(5, "segments-skeleton");
@@ -2248,6 +2277,7 @@ function renderReal(panel) {
                     </button>
                 </div>
             </div>
+            ${realNoticeHtml}
             <div class="page-body">
                 <div class="result-text" style="margin-bottom:12px;">
                     ${rumorsSkeleton}
@@ -2319,6 +2349,7 @@ function renderReal(panel) {
                 <div class="page-header">
                     <h3>验真助手 <div class="header-tags"><span class="beta-tag">Beta</span>${rumorsCacheTag}</div></h3>
                 </div>
+                ${realNoticeHtml}
                 ${renderErrorPanel(errorView, "run-rumors")}
             `;
             return;
@@ -2327,6 +2358,7 @@ function renderReal(panel) {
             <div class="page-header">
                 <h3>验真助手 <div class="header-tags"><span class="beta-tag">Beta</span>${rumorsCacheTag}</div></h3>
             </div>
+            ${realNoticeHtml}
             <div class="page-body subtitle-empty-container">
                 <div class="action-container">
                     <p class="action-tip">先问是不是，再问为什么。</p>
@@ -2344,6 +2376,7 @@ function renderReal(panel) {
                 ${actionButton}
             </div>
         </div>
+        ${realNoticeHtml}
         <div class="page-body">
             <div class="result-text" style="margin-bottom:12px;">${escapeHtml(rumors?.overview || "")}</div>
             <div class="claim-list">${claimListHtml}</div>
@@ -2562,7 +2595,7 @@ function renderSettings(panel) {
         "deepseek-ai/DeepSeek-V3.2",
         "Qwen3.5-27B"
     ];
-    const currentModel = String(settings.model || "").trim();
+    const currentModel = String(settings.model || "moonshotai/Kimi-K2.5").trim();
     const isModelScopeProvider = providerKey === "modelscope";
     const modelScopeSelectValue = modelScopeModelOptions.includes(currentModel) ? currentModel : "custom";
     const modelScopeCustomVisible = isModelScopeProvider && modelScopeSelectValue === "custom" ? "" : "settings-hidden";
@@ -3277,14 +3310,31 @@ function onChatStreamMessage(message) {
         const errorInput = toErrorInput(message, "请求失败");
         const view = mapErrorToView ? mapErrorToView(errorInput, "请求失败") : null;
         const error = view?.message || String(message?.error || message?.message || "请求失败");
+    
         appState.chatPending = (appState.chatPending || []).map((item) => {
             if (item.id !== assistantId) return item;
-            return { ...item, status: "done", content: `请求失败：${error}`, metrics: null };
+            return {
+                ...item,
+                status: "done",
+                content: `请求失败：${error}`,
+                metrics: null,
+                failed: true
+            };
         });
+    
         appState.chatStreamingId = "";
         appState.chatActiveMessageId = "";
         finishAsymptoticPseudoProgress(progressTaskId, true);
         rerenderChatKeepInputAndScroll("");
+    
+        setTimeout(() => {
+            appState.chatPending = (appState.chatPending || []).filter((item) => {
+                return !(item.id === assistantId && item.failed);
+            });
+            rerenderChatKeepInputAndScroll("");
+        }, 5000);
+    
+        return;
     }
 }
 
@@ -3321,6 +3371,13 @@ function resetPageStateByBvidSwitch() {
         appState.chatStreamTimer = null;
     }
     appState.chatGuideHidden = false;
+    
+    const chatPanel = panelShadowRoot ? panelShadowRoot.getElementById("page-chat") : null;
+    if (chatPanel) {
+    chatPanel.dataset.lastSignature = "";
+    chatPanel.innerHTML = "";
+    }
+    
     appState.followCurrentIndex = -1;
     appState.renderedSubtitleIndex = -1;
     closeCopyMenu();
@@ -3361,6 +3418,17 @@ function resetPageStateByBvidSwitch() {
     appState.progressTaskId = "";
     appState.progressLastPercent = 0;
     appState.progressLastTick = 0;
+    clearStepProgressTimers();
+    clearPseudoProgressTicker();
+    const currentBvid = normalizeBvidCase(resolveCurrentBvid() || getBvidFromUrl(location.href) || "");
+
+    if (appState.tabState && typeof appState.tabState === "object") {
+        appState.tabState = {
+            ...appState.tabState,
+            transcriptionProgress: 0
+        };
+    }
+
     appState.pseudoProgressTaskId = "";
     appState.pseudoProgressValue = 0;
     appState.pseudoProgressStartedAt = 0;
@@ -3392,6 +3460,14 @@ function resetAllState() {
     appState.chatStreamingId = "";
     appState.chatActiveMessageId = "";
     appState.sessionGeneratedTasks = new Set();
+    appState.chatGuideHidden = false;
+
+    const chatPanel = panelShadowRoot ? panelShadowRoot.getElementById("page-chat") : null;
+    if (chatPanel) {
+        chatPanel.dataset.lastSignature = "";
+        chatPanel.innerHTML = "";
+    }
+
     appState.subtitleDomDetected = false;
     resetTranscriptionState();
     appState.subtitleObserveUntil = 0;
@@ -4540,6 +4616,17 @@ async function startTranscriptionFromCapsule() {
 
     appState.progressTaskId = "";
     appState.progressLastPercent = 0;
+    appState.progressLastTick = 0;
+    clearStepProgressTimers();
+    clearPseudoProgressTicker();
+
+    if (appState.tabState && typeof appState.tabState === "object") {
+        appState.tabState = {
+            ...appState.tabState,
+            activeBvid: bvid,
+            transcriptionProgress: 0
+        };
+    }
 
     patchTranscriptionState({
         phase: "running",

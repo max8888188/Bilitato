@@ -23,6 +23,8 @@ import "./logger.js";
 
 let IS_DEBUG_MODE = false;
 
+
+
 function syncRuntimeDebugFlag(enabled) {
     IS_DEBUG_MODE = !!enabled;
     globalThis.AIPluginLogger?.setDebugEnabled?.(!!enabled);
@@ -76,7 +78,7 @@ const CLOUD_TASK_FIELD_MAP = {
 };
 const DEFAULT_SETTINGS = {
     provider: "modelscope",
-    model: "MiniMax/MiniMax-M2.5",
+    model: "moonshotai/Kimi-K2.5",
     apiKey: "",
     customBaseUrl: "",
     customProtocol: "openai",
