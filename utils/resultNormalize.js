@@ -104,11 +104,19 @@ export function normalizeSegments(value, hooks = {}) {
 }
 
 export function normalizeRumors(value) {
-    if (!value || typeof value !== "object") return null;
-    const claims = Array.isArray(value.claims) ? value.claims : [];
+    let source = value;
+    if (typeof source === "string") {
+        try {
+            source = JSON.parse(source);
+        } catch (_) {
+            return null;
+        }
+    }
+    if (!source || typeof source !== "object") return null;
+    const claims = Array.isArray(source.claims) ? source.claims : [];
     return {
-        overall_score: Number.isFinite(Number(value.overall_score)) ? Number(value.overall_score) : 0,
-        overview: String(value.overview || ""),
+        overall_score: Number.isFinite(Number(source.overall_score)) ? Number(source.overall_score) : 0,
+        overview: String(source.overview || ""),
         claims: claims.map((claim) => ({
             claim: String(claim.claim || claim.text || ""),
             verdict: String(claim.verdict || "unknown"),

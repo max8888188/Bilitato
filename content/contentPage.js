@@ -3,11 +3,13 @@
     const getBvidFromUrl = utils.getBvidFromUrl || (() => "");
 
     function resolveCurrentBvidFromState(state, href) {
+        const routeBvid = getBvidFromUrl(href || "");
+        if (routeBvid) return routeBvid;
         const injectBvid = String(state?.injectBvid || "").trim();
         if (injectBvid) return injectBvid;
         const activeBvid = String(state?.tabState?.activeBvid || "").trim();
         if (activeBvid) return activeBvid;
-        return getBvidFromUrl(href || "");
+        return "";
     }
 
     function resolveCidFromState(state) {

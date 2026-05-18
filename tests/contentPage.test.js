@@ -5,11 +5,21 @@ import "../content/contentPage.js";
 const page = globalThis.BilitatoContentPage;
 
 describe("contentPage", () => {
-  it("resolves current bvid from inject state first", () => {
+  it("resolves current bvid from url first", () => {
     expect(page.resolveCurrentBvidFromState({
       injectBvid: "BVinject",
       tabState: { activeBvid: "BVtab" }
-    }, "https://www.bilibili.com/video/BVurl1234567")).toBe("BVinject");
+    }, "https://www.bilibili.com/video/BVurl1234567")).toBe("BVurl1234567");
+  });
+
+  it("falls back to inject and tab state when url has no bvid", () => {
+    expect(page.resolveCurrentBvidFromState({
+      injectBvid: "BVinject",
+      tabState: { activeBvid: "BVtab" }
+    }, "https://www.bilibili.com/")).toBe("BVinject");
+    expect(page.resolveCurrentBvidFromState({
+      tabState: { activeBvid: "BVtab" }
+    }, "https://www.bilibili.com/")).toBe("BVtab");
   });
 
   it("resolves cid from inject, cache, then tab state", () => {

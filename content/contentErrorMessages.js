@@ -66,6 +66,13 @@
             message: "当前视频音频超过转录服务限制，暂时无法转录。",
             presentation: "panel"
         },
+        SUBTITLE_MISSING: {
+            title: "请求失败",
+            message: "未获取到视频字幕，请刷新页面后重试。",
+            actionText: "刷新",
+            action: "refresh-page",
+            presentation: "panel"
+        },
         CLOUD_FAILED: {
             title: "云端缓存暂时不可用",
             message: "云端缓存读取失败，不影响本地继续使用。",
@@ -90,37 +97,75 @@
         }
         if (/timeout|超时/i.test(message)) return "TIMEOUT";
         if (/network|failed to fetch|网络/i.test(message)) return "NETWORK_ERROR";
-        if (/JSON\s*解析失败|json_parse|JSON Parse|模型返回格式/i.test(message)) return "JSON_PARSE_ERROR";
+        if (/JSON\s*解析失败|json_parse|JSON Parse|模型返回格式|分段输出缺失|分段.*缺失/i.test(message)) return "JSON_PARSE_ERROR";
         if (/限流|rate limit|429/i.test(message) && /groq|转录/i.test(message)) return "ASR_RATE_LIMIT";
         if (/文件大小超出限制|音频过大|too large/i.test(message)) return "ASR_FILE_TOO_LARGE";
+        if (/未获取到视频字幕|无字幕可供分析|当前视频暂无字幕|未检测到字幕/i.test(message)) return "SUBTITLE_MISSING";
         return "UNKNOWN";
     }
 
-    function mapErrorToView(errorInput, fallbackMessage = "请求失败") {
+    function mapErrorToView(errorInput, fallbackMessage = "请求失败", context = {}) {
         const code = inferErrorCode(errorInput);
         const base = ERROR_VIEW_MAP[code] || {
             title: "请求失败",
             message: String(errorInput?.message || errorInput || fallbackMessage),
             presentation: "toast"
         };
-        return {
+        const view = {
             code,
             ...base,
             rawMessage: String(errorInput?.message || errorInput || "")
         };
+        const provider = String(context?.provider || errorInput?.provider || "").toLowerCase();
+        if (code === "HTTP_401" && provider === "modelscope") {
+            view.extraMessage = "请务必确保您的 ModelScope 账号已绑定阿里云！";
+            view.helper = {
+                type: "modelscope-bind",
+                url: "https://modelscope.cn/my/settings/account"
+            };
+            view.actionText = "修改 API";
+            view.secondaryActionText = "重试";
+            view.secondaryAction = "retry";
+        }
+        if (view.presentation !== "toast" && view.action !== "retry" && view.secondaryAction !== "retry") {
+            view.secondaryActionText = "重试";
+            view.secondaryAction = "retry";
+        }
+        return view;
     }
 
     function renderErrorPanel(view, retryAction = "") {
         const safe = globalThis.BilitatoContentUtils?.escapeHtml || ((value) => String(value || ""));
         const action = view.action === "retry" && retryAction ? retryAction : view.action;
-        const button = action && view.actionText
+        const primaryButton = action && view.actionText
             ? `<button class="action-btn" data-action="${safe(action)}">${safe(view.actionText)}</button>`
             : "";
+        const secondaryAction = view.secondaryAction === "retry" && retryAction ? retryAction : view.secondaryAction;
+        const secondaryButton = secondaryAction && view.secondaryActionText
+            ? `<button class="action-btn ghost" data-action="${safe(secondaryAction)}">${safe(view.secondaryActionText)}</button>`
+            : "";
+        const extraMessage = view.extraMessage
+            ? `<div class="error-extra-message">${safe(view.extraMessage)}</div>`
+            : "";
+        const aliyunImageUrl = globalThis.chrome?.runtime?.getURL
+            ? globalThis.chrome.runtime.getURL("assets/ui/aliyun.png")
+            : "assets/ui/aliyun.png";
+        const helper = view.helper?.type === "modelscope-bind"
+            ? `<div class="modelscope-bind-hint">
+                    <img class="modelscope-bind-image" src="${safe(aliyunImageUrl)}" alt="ModelScope 绑定阿里云账号示意">
+                    <button class="modelscope-bind-open" type="button" data-action="open-external-url" data-url="${safe(view.helper.url || "")}">打开 ModelScope 账号设置</button>
+                </div>`
+            : "";
+        const buttons = primaryButton || secondaryButton
+            ? `<div class="error-actions">${primaryButton}${secondaryButton}</div>`
+            : "";
         return `
-            <div class="page-body subtitle-empty-container">
-                <div class="action-container">
-                    <p class="action-tip"><strong>${safe(view.title)}</strong><br>${safe(view.message)}</p>
-                    ${button}
+            <div class="page-body subtitle-empty-container error-empty-container">
+                <div class="action-container error-panel-card">
+                    <div class="action-tip error-panel-copy"><strong>${safe(view.title)}</strong><span>${safe(view.message)}</span></div>
+                    ${extraMessage}
+                    ${helper}
+                    ${buttons}
                 </div>
             </div>
         `;

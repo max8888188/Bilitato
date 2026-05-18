@@ -457,8 +457,9 @@ async function handleMessage(msg, sender) {
         if (!tabId) throw new Error("tabId 缺失");
         const tasks = Array.isArray(msg.tasks) ? msg.tasks.filter((task) => TASK_KEYS.includes(task)) : [];
         if (!tasks.length) throw new Error("任务为空");
-        logBackground.info("task_enqueue", { tab_id: tabId, tasks, force: msg.force !== false });
-        await runTasksForTab(tabId, tasks, msg.force !== false, normalizeTaskContext(msg.taskContext));
+        const requestedBvid = normalizeBvid(msg.bvid);
+        logBackground.info("task_enqueue", { tab_id: tabId, bvid: requestedBvid, tasks, force: msg.force !== false });
+        await runTasksForTab(tabId, tasks, msg.force !== false, normalizeTaskContext(msg.taskContext), requestedBvid);
         return {};
     }
     if (msg.action === "RUN_CHAT") {
@@ -1795,10 +1796,13 @@ function makeSubtitleHash(list) {
     return `${list.length}|${first.start}|${last.end ?? last.start}|${first.text.slice(0, 24)}|${last.text.slice(0, 24)}`;
 }
 
-async function runTasksForTab(tabId, tasks, force, taskContext = {}) {
+async function runTasksForTab(tabId, tasks, force, taskContext = {}, requestedBvid = "") {
     const tabState = await getTabState(tabId);
-    const bvid = tabState?.activeBvid;
+    const bvid = normalizeBvid(requestedBvid || tabState?.activeBvid);
     if (!bvid) throw new Error("未获取到视频字幕");
+    if (normalizeBvid(tabState?.activeBvid) !== bvid) {
+        await updateTabState(tabId, { activeBvid: bvid, updatedAt: Date.now() });
+    }
     const resolvedSettings = await getResolvedSettings();
     await hydrateCloudCacheIfNeeded(bvid, tasks, resolvedSettings);
     const hasSummarySegments = tasks.includes("summary") && tasks.includes("segments");
@@ -3024,6 +3028,7 @@ function normalizeSettings(settings) {
     const base = settings && typeof settings === "object" ? settings : {};
     const customProtocol = String(base.customProtocol || "openai").toLowerCase() === "claude" ? "claude" : "openai";
     const asrProvider = String(base.asrProvider || DEFAULT_SETTINGS.asrProvider || "groq").toLowerCase() === "siliconflow" ? "siliconflow" : "groq";
+    const apiKey = String(base.apiKey || "").trim();
     const groqApiKey = String(base.groqApiKey || "").trim();
     const groqModel = String(base.groqModel || DEFAULT_SETTINGS.groqModel || "whisper-large-v3-turbo").trim() || "whisper-large-v3-turbo";
     const siliconFlowApiKey = String(base.siliconFlowApiKey || "").trim();
@@ -3042,6 +3047,7 @@ function normalizeSettings(settings) {
         ...DEFAULT_SETTINGS,
         ...base,
         debugMode: !!base.debugMode,
+        apiKey,
         sentryEnabled,
         sentryDsn,
         customProtocol,
@@ -3237,7 +3243,7 @@ function buildSupabaseVideoPatch(bvid, settings, patch) {
         row.segments_model = modelName;
     }
     if (Object.prototype.hasOwnProperty.call(patch, "rumors")) {
-        row.rumors = patch.rumors && typeof patch.rumors === "object" ? patch.rumors : null;
+        row.rumors = patch.rumors && typeof patch.rumors === "object" ? JSON.stringify(patch.rumors) : null;
         row.rumors_model = modelName;
     }
     return row;
@@ -3280,8 +3286,16 @@ async function fetchVideoCacheMetaRow(bvid, settings, columns = []) {
     const fieldList = ["bvid", ...(Array.isArray(columns) ? columns : [])]
         .filter(Boolean)
         .filter((value, index, arr) => arr.indexOf(value) === index);
-    if (!normalizedBvid || fieldList.length < 2) return null;
-    const rows = await supabaseSelect(settings, settings.supabaseVideoCacheTable || SUPABASE_DEFAULT_VIDEO_CACHE_TABLE, {
+    if (!normalizedBvid) return null;
+    const table = settings.supabaseVideoCacheTable || SUPABASE_DEFAULT_VIDEO_CACHE_TABLE;
+    logCache.debug("cloud_meta_fetch_start", {
+        bvid: normalizedBvid,
+        detail: {
+            table,
+            fields: fieldList
+        }
+    });
+    const rows = await supabaseSelect(settings, table, {
         select: fieldList.join(","),
         bvid: `eq.${normalizedBvid}`,
         limit: "1"
@@ -3289,7 +3303,30 @@ async function fetchVideoCacheMetaRow(bvid, settings, columns = []) {
         requestName: "video_cache_meta_fetch",
         errorMessage: "video_cache 查询失败"
     });
-    return Array.isArray(rows) && rows.length ? rows[0] : null;
+    const row = Array.isArray(rows) && rows.length ? rows[0] : null;
+    logCache.debug("cloud_meta_fetch_success", {
+        bvid: normalizedBvid,
+        detail: {
+            table,
+            found: !!row,
+            fields: fieldList
+        }
+    });
+    return row;
+}
+
+function getVideoCacheUploadFields(row) {
+    return Object.keys(row || {}).filter((key) => key !== "bvid" && key !== "updated_at");
+}
+
+function isSupabaseDuplicateKeyError(error) {
+    const text = [
+        error?.code,
+        error?.message,
+        error?.responseText,
+        error?.details
+    ].filter(Boolean).join("\n");
+    return /23505|duplicate key|already exists|violates unique constraint/i.test(text);
 }
 
 async function saveVideoCacheRow(bvid, settings, row, existingRow = null) {
@@ -3298,12 +3335,76 @@ async function saveVideoCacheRow(bvid, settings, row, existingRow = null) {
     const table = settings.supabaseVideoCacheTable || SUPABASE_DEFAULT_VIDEO_CACHE_TABLE;
     const hasExisting = !!(existingRow && typeof existingRow === "object" && String(existingRow.bvid || "").trim());
     const method = hasExisting ? "PATCH" : "POST";
-    await supabaseWrite(settings, table, row, {
-        method,
-        params: hasExisting ? { bvid: `eq.${normalizedBvid}` } : {},
-        requestName: "video_cache_write",
-        errorMessage: `video_cache ${method} 失败`
+    const fields = getVideoCacheUploadFields(row);
+    logCache.info("cloud_cache_upload_start", {
+        task: "cloud",
+        bvid: normalizedBvid,
+        detail: {
+            table,
+            method,
+            has_existing: hasExisting,
+            fields
+        }
     });
+    try {
+        await supabaseWrite(settings, table, row, {
+            method,
+            params: hasExisting ? { bvid: `eq.${normalizedBvid}` } : {},
+            requestName: "video_cache_write",
+            errorMessage: `video_cache ${method} 失败`
+        });
+        logCache.info("cloud_cache_upload_success", {
+            task: "cloud",
+            bvid: normalizedBvid,
+            detail: {
+                table,
+                method,
+                fields
+            }
+        });
+    } catch (error) {
+        if (method === "POST" && isSupabaseDuplicateKeyError(error)) {
+            logCache.warn("cloud_cache_upload_retry_update", {
+                task: "cloud",
+                bvid: normalizedBvid,
+                code: "SUPABASE_DUPLICATE_POST_RETRY_PATCH",
+                detail: {
+                    table,
+                    fields,
+                    reason: "post_duplicate_key"
+                }
+            });
+            await supabaseWrite(settings, table, row, {
+                method: "PATCH",
+                params: { bvid: `eq.${normalizedBvid}` },
+                requestName: "video_cache_write_retry_patch",
+                errorMessage: "video_cache POST 冲突后 PATCH 失败"
+            });
+            logCache.info("cloud_cache_upload_success", {
+                task: "cloud",
+                bvid: normalizedBvid,
+                detail: {
+                    table,
+                    method: "PATCH",
+                    retry_from: "POST_DUPLICATE",
+                    fields
+                }
+            });
+            return true;
+        }
+        logBackground.error("cloud_cache_upload_failed", {
+            task: "cloud",
+            bvid: normalizedBvid,
+            code: "SUPABASE_VIDEO_CACHE_UPLOAD_FAILED",
+            detail: {
+                table,
+                method,
+                fields,
+                error_message: error.message || "video_cache upload failed"
+            }
+        });
+        throw error;
+    }
     return true;
 }
 
@@ -3338,8 +3439,29 @@ async function persistCloudSubtitlePatch(bvid, settings, cache, extra = {}) {
         });
         const meaningfulKeys = Object.keys(row).filter((key) => key !== "bvid" && key !== "updated_at");
         if (!meaningfulKeys.length) return false;
+        logCache.info("cloud_subtitle_write_start", {
+            task: "cloud",
+            bvid: normalizedBvid,
+            detail: {
+                fields: meaningfulKeys,
+                raw_count: rawSubtitle.length,
+                processed_count: processedSubtitle.length,
+                subtitle_source: subtitleSource,
+                next_upload_count: row.subtitle_upload_count || 0
+            }
+        });
         await saveVideoCacheRow(normalizedBvid, settings, row, current);
-        logCache.info("cloud_subtitle_write", { bvid: normalizedBvid, fields: meaningfulKeys });
+        logCache.info("cloud_subtitle_write", {
+            task: "cloud",
+            bvid: normalizedBvid,
+            detail: {
+                fields: meaningfulKeys,
+                raw_count: rawSubtitle.length,
+                processed_count: processedSubtitle.length,
+                subtitle_source: subtitleSource,
+                upload_count: row.subtitle_upload_count || 0
+            }
+        });
         return true;
     } catch (error) {
         logBackground.error("cloud_subtitle_write_fail", {
@@ -3372,8 +3494,26 @@ async function incrementCloudVideoCallCount(bvid, settings, task) {
         const row = buildSupabaseVideoPatch(normalizedBvid, settings, {
             [patchKey]: nextValue
         });
+        logCache.info("cloud_call_count_increment_start", {
+            task: "cloud",
+            bvid: normalizedBvid,
+            detail: {
+                feature: normalizedTask,
+                field: targetField,
+                previous_value: Math.max(0, Number(current?.[targetField] || 0)),
+                next_value: nextValue
+            }
+        });
         await saveVideoCacheRow(normalizedBvid, settings, row, current);
-        logCache.info("cloud_call_count_increment", { bvid: normalizedBvid, task: normalizedTask, value: nextValue });
+        logCache.info("cloud_call_count_increment", {
+            task: "cloud",
+            bvid: normalizedBvid,
+            detail: {
+                feature: normalizedTask,
+                field: targetField,
+                value: nextValue
+            }
+        });
         return true;
     } catch (error) {
         logBackground.error("cloud_call_count_increment_fail", {
@@ -3405,8 +3545,25 @@ async function persistCloudFeaturePatch(bvid, settings, patch) {
     }
     try {
         const current = await fetchVideoCacheMetaRow(row.bvid, settings, ["updated_at"]);
+        logCache.info("cloud_feature_write_start", {
+            task: "cloud",
+            bvid: row.bvid,
+            detail: {
+                fields: meaningfulKeys,
+                feature_fields: Object.keys(filteredPatch),
+                has_existing: !!current
+            }
+        });
         await saveVideoCacheRow(row.bvid, settings, row, current);
-        logCache.info("cloud_cache_write", { bvid: row.bvid, fields: meaningfulKeys });
+        logCache.info("cloud_cache_write", {
+            task: "cloud",
+            bvid: row.bvid,
+            detail: {
+                fields: meaningfulKeys,
+                feature_fields: Object.keys(filteredPatch),
+                has_existing: !!current
+            }
+        });
         return true;
     } catch (error) {
         logBackground.error("cloud_cache_write_fail", {
@@ -3503,6 +3660,21 @@ async function reportDailyFeatureUsage(featureName, settings, metrics = {}, stat
             v_bvid: normalizedContext.bvid,
             v_title: normalizedContext.title
         };
+        logAI.info("usage_daily_report_start", {
+            task: "usage",
+            bvid: normalizedContext.bvid,
+            detail: {
+                feature: normalizedFeature,
+                status: String(status || "success"),
+                error_code: String(errorCode || ""),
+                provider: legacyPayload.p_provider,
+                model: legacyPayload.p_model,
+                extension_version: legacyPayload.ext_version,
+                title: normalizedContext.title,
+                tokens: legacyPayload.t_count,
+                duration_ms: legacyPayload.d_ms
+            }
+        });
         try {
             await supabaseRpc(settings, rpcName, nextPayload, {
                 requestName: "usage_daily_report",
@@ -3516,6 +3688,7 @@ async function reportDailyFeatureUsage(featureName, settings, metrics = {}, stat
             });
             logBackground.warn("usage_daily_legacy_payload", {
                 task: "usage",
+                bvid: normalizedContext.bvid,
                 detail: {
                     feature: normalizedFeature,
                     reason: "rpc_schema_not_upgraded"
@@ -3528,8 +3701,13 @@ async function reportDailyFeatureUsage(featureName, settings, metrics = {}, stat
             detail: {
                 feature: normalizedFeature,
                 status: String(status || "success"),
+                error_code: String(errorCode || ""),
+                provider: legacyPayload.p_provider,
+                model: legacyPayload.p_model,
+                extension_version: legacyPayload.ext_version,
                 title: normalizedContext.title,
-                tokens: Math.max(0, Number(metrics?.tokens || 0))
+                tokens: Math.max(0, Number(metrics?.tokens || 0)),
+                duration_ms: legacyPayload.d_ms
             }
         });
         return true;
@@ -3537,8 +3715,11 @@ async function reportDailyFeatureUsage(featureName, settings, metrics = {}, stat
         logBackground.error("usage_daily_report_fail", {
             task: "usage",
             code: "USAGE_DAILY_REPORT_FAILED",
+            bvid: normalizeBvid(usageContext?.bvid || metrics?.bvid || ""),
             detail: {
                 feature: normalizedFeature,
+                status: String(status || "success"),
+                error_code: String(errorCode || ""),
                 error_message: error.message || "daily usage report failed"
             }
         });

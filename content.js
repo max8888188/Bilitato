@@ -243,7 +243,9 @@ function toErrorInput(error, fallbackMessage = "请求失败") {
 }
 
 function setPanelError(page, error, fallbackMessage = "请求失败") {
-    const view = mapErrorToView ? mapErrorToView(toErrorInput(error, fallbackMessage), fallbackMessage) : null;
+    const view = mapErrorToView ? mapErrorToView(toErrorInput(error, fallbackMessage), fallbackMessage, {
+        provider: appState.settings?.provider || ""
+    }) : null;
     if (!view) return null;
     appState.panelErrors = {
         ...(appState.panelErrors || {}),
@@ -261,7 +263,9 @@ function clearPanelError(page) {
 }
 
 function notifyMappedError(error, fallbackMessage = "请求失败") {
-    const view = mapErrorToView ? mapErrorToView(toErrorInput(error, fallbackMessage), fallbackMessage) : null;
+    const view = mapErrorToView ? mapErrorToView(toErrorInput(error, fallbackMessage), fallbackMessage, {
+        provider: appState.settings?.provider || ""
+    }) : null;
     showToast(view?.message || fallbackMessage);
     return view;
 }
@@ -277,9 +281,12 @@ function runErrorDisplayDemo(code, target = "summary") {
     const error = {
         code: normalizedCode,
         status: normalizedCode.match(/^HTTP_(\d{3})$/)?.[1] ? Number(normalizedCode.match(/^HTTP_(\d{3})$/)?.[1]) : undefined,
-        message: normalizedCode
+        message: normalizedCode,
+        provider: appState.settings?.provider || ""
     };
-    const view = mapErrorToView ? mapErrorToView(error, "测试错误") : null;
+    const view = mapErrorToView ? mapErrorToView(error, "测试错误", {
+        provider: appState.settings?.provider || ""
+    }) : null;
     if (!view) return;
     if (view.presentation === "toast") {
         showToast(view.message);
@@ -1210,6 +1217,17 @@ function bindPanelDelegatedEvents() {
             saveSettingsFromPanel();
             return;
         }
+        if (action === "settings-toggle-secret") {
+            const targetId = String(actionNode.dataset.target || "").trim();
+            const input = targetId && panelShadowRoot ? panelShadowRoot.getElementById(targetId) : null;
+            if (input) {
+                const nextVisible = input.type === "password";
+                input.type = nextVisible ? "text" : "password";
+                actionNode.textContent = nextVisible ? "隐藏" : "显示";
+                actionNode.setAttribute("aria-label", nextVisible ? "隐藏密钥明文" : "显示密钥明文");
+            }
+            return;
+        }
         if (action === "open-feedback") {
             window.open("https://www.wenjuan.com/s/UZBZJvus3xI/", "_blank", "noopener,noreferrer");
             return;
@@ -1229,6 +1247,15 @@ function bindPanelDelegatedEvents() {
         if (action === "settings-open-reg") {
             const url = String(actionNode.dataset.url || "").trim();
             if (url) window.open(url, "_blank", "noopener,noreferrer");
+            return;
+        }
+        if (action === "open-external-url") {
+            const url = String(actionNode.dataset.url || "").trim();
+            if (url) window.open(url, "_blank", "noopener,noreferrer");
+            return;
+        }
+        if (action === "refresh-page") {
+            window.location.reload();
             return;
         }
         if (action === "settings-open-guide") {
@@ -1874,7 +1901,10 @@ function renderCC(panel, rowsOverride) {
     const isNoTimestampSubtitle = subtitleSource === "siliconflow" || subtitleSource === "funasr";
     const shouldShowRegenerate = rows.length > 0 && isAsrSubtitle && !running;
 
-    const sourceText = rows.length ? (isAsrSubtitle ? "ASR转录生成" : "官方AI字幕") : "未检测到字幕";
+    const subtitleCacheSource = String(appState.cache?.subtitleCacheSource || "").toLowerCase();
+    const sourceText = rows.length
+        ? (subtitleCacheSource === "cloud" ? "云端缓存" : (isAsrSubtitle ? "ASR转录生成" : "官方AI字幕"))
+        : "未检测到字幕";
     const refreshIconSrc = chrome.runtime.getURL(`${UI_ICON_BASE_DIR}/default/refresh.png`);
     const regenBtnHtml = shouldShowRegenerate ? `<button class="panel-icon-btn" data-action="cc-regenerate-transcribe" title="重新生成"><img src="${refreshIconSrc}" style="width:16px;height:16px;object-fit:contain;transform:scale(0.9);"></button>` : "";
     const searchBoxHtml = `<div class="cc-search-container"><input type="text" id="cc-search-input" class="cc-search-input" placeholder="搜索字幕..." /><button type="button" class="cc-search-clear" aria-label="清空">×</button></div>`;
@@ -2581,6 +2611,13 @@ function renderSettings(panel) {
             </div>
         `;
     };
+    const renderSecretInput = (id, value, placeholder, errorText = "API Key 不能包含中文或空格，首尾空格会自动清理") => `
+        <div class="settings-secret-field">
+            <input id="${escapeHtmlAttr(id)}" data-secret-input="true" type="password" value="${escapeHtml(value || "")}" placeholder="${escapeHtmlAttr(placeholder)}" autocomplete="off" spellcheck="false">
+            <button type="button" class="settings-secret-toggle" data-action="settings-toggle-secret" data-target="${escapeHtmlAttr(id)}" aria-label="显示密钥明文">显示</button>
+        </div>
+        <div class="error-message" id="${escapeHtmlAttr(id)}-error">${escapeHtml(errorText)}</div>
+    `;
     const promptSettings = normalizePromptSettingsState(settings.promptSettings);
     const promptMode = promptSettings.mode === "custom" ? "custom" : "guided";
     const promptSummary = String(promptSettings.custom.summary || "");
@@ -2652,8 +2689,7 @@ function renderSettings(panel) {
                 </div>
                 <div class="settings-provider-url">${escapeHtml(provider.baseUrl || "-")}</div>
                 <label>API Key</label>
-                <input id="settings-api-key" type="password" value="${escapeHtml(settings.apiKey || "")}" placeholder="示例：sk-xxxxx">
-                <div class="error-message" id="settings-api-key-error">API Key 不能包含中文或空格</div>
+                ${renderSecretInput("settings-api-key", settings.apiKey || "", "示例：sk-xxxxx")}
                 <label>Model</label>
                 <div id="settings-modelscope-model-wrap" class="${modelScopeWrapVisible}">
                     ${renderCustomSelect("settings-modelscope-model", [
@@ -2693,13 +2729,13 @@ function renderSettings(panel) {
                 </div>
                 <div id="settings-asr-groq-wrap" class="settings-asr-provider-fields ${groqVisible}">
                     <label>Groq API Key</label>
-                    <input id="settings-groq-api-key" type="password" value="${escapeHtml(settings.groqApiKey || "")}" placeholder="示例：gsk_xxxxx">
+                    ${renderSecretInput("settings-groq-api-key", settings.groqApiKey || "", "示例：gsk_xxxxx")}
                     <label>ASR 模型</label>
                     <input id="settings-groq-model" type="text" value="${escapeHtml(groqModel)}" placeholder="示例：whisper-large-v3-turbo">
                 </div>
                 <div id="settings-asr-siliconflow-wrap" class="settings-asr-provider-fields ${siliconFlowVisible}">
                     <label>硅基流动 API Key</label>
-                    <input id="settings-siliconflow-api-key" type="password" value="${escapeHtml(settings.siliconFlowApiKey || "")}" placeholder="示例：sk-xxxxx">
+                    ${renderSecretInput("settings-siliconflow-api-key", settings.siliconFlowApiKey || "", "示例：sk-xxxxx")}
                     <label>ASR 模型</label>
                     <input id="settings-siliconflow-asr-model" type="text" value="${escapeHtml(siliconFlowAsrModel)}" placeholder="示例：FunAudioLLM/SenseVoiceSmall">
                 </div>
@@ -2922,33 +2958,38 @@ function renderSettings(panel) {
     }
     applyPromptModeVisibility();
 
-    const apiKeyInput = panel.querySelector("#settings-api-key");
-    const apiKeyError = panel.querySelector("#settings-api-key-error");
-
-    const validateApiKey = () => {
-        if (!apiKeyInput) return true;
-        const val = apiKeyInput.value;
-        const invalid = /[ \u4e00-\u9fa5]/.test(val);
+    const secretInputs = Array.from(panel.querySelectorAll("[data-secret-input]"));
+    const normalizeSecretInput = (input) => {
+        if (!input) return "";
+        const trimmed = String(input.value || "").trim();
+        if (input.value !== trimmed) input.value = trimmed;
+        return trimmed;
+    };
+    const validateSecretInput = (input, shouldTrim = false) => {
+        if (!input) return true;
+        const val = shouldTrim ? normalizeSecretInput(input) : String(input.value || "");
+        const invalid = /[\s\u4e00-\u9fa5]/.test(val);
+        const errorNode = panel.querySelector(`#${input.id}-error`);
         if (invalid) {
-            apiKeyInput.classList.add("input-error");
-            if (apiKeyError) apiKeyError.classList.add("show");
+            input.classList.add("input-error");
+            if (errorNode) errorNode.classList.add("show");
             return false;
         }
-        apiKeyInput.classList.remove("input-error");
-        if (apiKeyError) apiKeyError.classList.remove("show");
+        input.classList.remove("input-error");
+        if (errorNode) errorNode.classList.remove("show");
         return true;
     };
 
     const inputs = panel.querySelectorAll("input, textarea");
     inputs.forEach(input => {
         if (input.type === "range") return;
-        if (input.id === "settings-api-key") {
+        if (input.dataset.secretInput === "true") {
             input.addEventListener("input", () => {
-                validateApiKey();
+                validateSecretInput(input, false);
             });
         }
         input.addEventListener("blur", () => {
-            if (input.id === "settings-api-key" && !validateApiKey()) return;
+            if (input.dataset.secretInput === "true" && !validateSecretInput(input, true)) return;
             triggerAutoSave();
         });
     });
@@ -3003,6 +3044,7 @@ function renderErrorDemoControls() {
         ["NETWORK_ERROR", "网络失败", "summary"],
         ["JSON_PARSE_ERROR", "JSON 格式", "summary"],
         ["ASR_FILE_TOO_LARGE", "音频过大", "summary"],
+        ["SUBTITLE_MISSING", "未获取到字幕", "summary"],
         ["HTTP_401", "聊天 401", "chat"],
         ["JSON_PARSE_ERROR", "验真 JSON", "real"]
     ];
@@ -3092,7 +3134,13 @@ async function runTasks(tasks) {
         startAsymptoticPseudoProgress(taskId, 12);
         const durationMeta = resolveVideoDurationMeta();
         const taskContext = durationMeta ? { videoDuration: durationMeta } : {};
-        const res = await chrome.runtime.sendMessage({ action: "RUN_TASKS", tasks, force: true, taskContext });
+        const res = await chrome.runtime.sendMessage({
+            action: "RUN_TASKS",
+            tasks,
+            force: true,
+            bvid: normalizeBvidCase(resolveCurrentBvid() || ""),
+            taskContext
+        });
         if (!res?.ok) throw new Error(res?.error || "任务失败");
         finishAsymptoticPseudoProgress(taskId, false);
     } catch (error) {
@@ -3638,6 +3686,28 @@ function shouldAttemptCloudReadForPage(page) {
     return shouldAttemptCloudReadForPageState(appState.cache, appState.cloudReadState, resolveCurrentBvid(), page);
 }
 
+function isAsrSubtitleSourceValue(source) {
+    const value = String(source || "").toLowerCase();
+    return value === "groq" || value === "whisper" || value === "siliconflow" || value === "funasr";
+}
+
+function applyCacheSubtitleState(cache, targetBvid = "") {
+    const target = normalizeBvidCase(targetBvid || cache?.bvid || resolveCurrentBvid() || "");
+    if (!target || !cache || normalizeBvidCase(cache?.bvid || "") !== target) return;
+    const subtitleSource = String(cache?.subtitleSource || "");
+    appState.tabState = {
+        ...(appState.tabState || {}),
+        activeBvid: target,
+        subtitleSource: subtitleSource || appState.tabState?.subtitleSource || "",
+        transcriptionProgress: isAsrSubtitleSourceValue(subtitleSource)
+            ? 100
+            : Number(appState.tabState?.transcriptionProgress || 0)
+    };
+    if (hasUsableSubtitleCache(cache, target)) {
+        appState.subtitleCapturedBvid = target;
+    }
+}
+
 function startCloudReadForCurrentVideo(options = {}) {
     const target = normalizeBvidCase(options?.bvid || resolveCurrentBvid() || "");
     if (!target) return;
@@ -3663,8 +3733,12 @@ function startCloudReadForCurrentVideo(options = {}) {
             const cacheUpdated = !!(cache && normalizeBvidCase(cache?.bvid || "") === target);
             if (cache && normalizeBvidCase(cache?.bvid || "") === target) {
                 appState.cache = cache;
+                applyCacheSubtitleState(cache, target);
             }
             if (res?.tabState) appState.tabState = res.tabState;
+            if (cache && normalizeBvidCase(cache?.bvid || "") === target) {
+                applyCacheSubtitleState(cache, target);
+            }
             appState.cloudReadState = createCloudReadState(target, "success", nextRequestId);
             if (cacheUpdated || !silent) renderContent();
         })
@@ -3878,17 +3952,22 @@ async function saveSettingsFromPanel(isAutoSave = false, options = {}) {
     if (!panel) return;
     const opts = options && typeof options === "object" ? options : {};
     
-    // Validate API Key globally before saving
-    const apiKeyInput = panel.querySelector("#settings-api-key");
-    if (apiKeyInput) {
-        const val = apiKeyInput.value;
-        const invalid = /[ \u4e00-\u9fa5]/.test(val);
+    // Validate API Keys globally before saving. Leading/trailing spaces are trimmed;
+    // inner spaces still block saving because providers reject them.
+    const secretInputs = Array.from(panel.querySelectorAll("[data-secret-input]"));
+    for (const input of secretInputs) {
+        const trimmed = String(input.value || "").trim();
+        if (input.value !== trimmed) input.value = trimmed;
+        const invalid = /[\s\u4e00-\u9fa5]/.test(trimmed);
         if (invalid) {
-            const apiKeyError = panel.querySelector("#settings-api-key-error");
-            apiKeyInput.classList.add("input-error");
+            const apiKeyError = panel.querySelector(`#${input.id}-error`);
+            input.classList.add("input-error");
             if (apiKeyError) apiKeyError.classList.add("show");
             return;
         }
+        input.classList.remove("input-error");
+        const apiKeyError = panel.querySelector(`#${input.id}-error`);
+        if (apiKeyError) apiKeyError.classList.remove("show");
     }
 
     const statusEl = panel.querySelector("#save-status");
@@ -5379,14 +5458,7 @@ async function syncActiveCacheByBvid(expectedBvid) {
         if (normalizeBvidCase(appState.tabState?.activeBvid || "") !== target) return;
         const nextCache = res?.[`cache_${target}`] || null;
         appState.cache = nextCache && normalizeBvidCase(nextCache?.bvid || "") === target ? nextCache : null;
-        const cachedSubtitleSource = String(appState.cache?.subtitleSource || "");
-        if (cachedSubtitleSource) {
-            appState.tabState = {
-                ...(appState.tabState || {}),
-                subtitleSource: cachedSubtitleSource,
-                transcriptionProgress: (cachedSubtitleSource === "groq" || cachedSubtitleSource === "whisper" || cachedSubtitleSource === "siliconflow" || cachedSubtitleSource === "funasr") ? 100 : Number(appState.tabState?.transcriptionProgress || 0)
-            };
-        }
+        applyCacheSubtitleState(appState.cache, target);
         if (hasUsableSubtitleCache(appState.cache, target)) {
             appState.subtitleCapturedBvid = target;
             if (!isTranscriptionRunning()) {
@@ -5462,14 +5534,7 @@ async function syncCacheFromBackground(bvid, options = {}) {
         }
         appState.cache = cache;
         if (res.tabState) appState.tabState = res.tabState;
-        const cachedSubtitleSource = String(cache?.subtitleSource || "");
-        if (cachedSubtitleSource) {
-            appState.tabState = {
-                ...(appState.tabState || {}),
-                subtitleSource: cachedSubtitleSource,
-                transcriptionProgress: (cachedSubtitleSource === "groq" || cachedSubtitleSource === "whisper" || cachedSubtitleSource === "siliconflow" || cachedSubtitleSource === "funasr") ? 100 : Number(appState.tabState?.transcriptionProgress || 0)
-            };
-        }
+        applyCacheSubtitleState(cache, target);
         appState.subtitleCapturedBvid = target;
         reconcileTranscriptionState(target);
         appState.isStateDirty = false;

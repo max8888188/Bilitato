@@ -53,6 +53,20 @@ describe("normalizeRumors", () => {
     });
   });
 
+  it("parses cached JSON string values", () => {
+    const result = normalizeRumors(JSON.stringify({
+      overall_score: 61,
+      overview: "需要核查",
+      claims: [{ claim: "一个说法", verdict: "uncertain" }]
+    }));
+
+    expect(result).toMatchObject({
+      overall_score: 61,
+      overview: "需要核查",
+      claims: [{ claim: "一个说法", verdict: "uncertain" }]
+    });
+  });
+
   it("returns null for non-object inputs", () => {
     expect(normalizeRumors(null)).toBeNull();
     expect(normalizeRumors("nope")).toBeNull();
