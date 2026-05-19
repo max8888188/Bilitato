@@ -1642,7 +1642,7 @@ function renderSummary(panel) {
     const isFresh = appState.sessionGeneratedTasks.has("summary") || appState.sessionGeneratedTasks.has("segments");
     const cacheTag = buildCacheTagHtml(appState.cache, ["summary", "segments"], hasContent, isLoading, isFresh);
     const showModeNotice = !appState.settings?.summaryModeNoticeSeen && !isFresh;
-    const isFastMode = (appState.settings?.prefMode || "efficiency") === "quality";
+    const isFastMode = (appState.settings?.prefMode || "quality") === "quality";
     const modeNoticeHtml = showModeNotice ? `
         <div class="summary-mode-notice">
             <div class="summary-mode-notice-text">

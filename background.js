@@ -91,7 +91,7 @@ const DEFAULT_SETTINGS = {
     supabaseAnonKey: "sb_publishable_55zwbZc_sQ0k4EDJBgpxsQ_1F86l1vT",
     supabaseVideoCacheTable: SUPABASE_DEFAULT_VIDEO_CACHE_TABLE,
     supabaseUsageDailyRpcName: SUPABASE_DEFAULT_USAGE_DAILY_RPC,
-    prefMode: "efficiency",
+    prefMode: "quality",
     debugMode: false,
     sentryEnabled: true,
     sentryDsn: DEFAULT_SENTRY_DSN
