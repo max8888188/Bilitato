@@ -1236,6 +1236,17 @@ function bindPanelDelegatedEvents() {
             saveSettingsFromPanel();
             return;
         }
+        if (action === "summary-mode-notice-dismiss") {
+            const nextSettings = { ...(appState.settings || {}), summaryModeNoticeSeen: true };
+            appState.settings = nextSettings;
+            chrome.storage.local.set({ settings: nextSettings }).catch?.(() => {});
+            const notice = actionNode.closest(".summary-mode-notice");
+            if (notice) notice.remove();
+            const panel = panelShadowRoot ? panelShadowRoot.getElementById("page-summary") : null;
+            if (panel) panel.dataset.lastSignature = "";
+            renderContent();
+            return;
+        }
         if (action === "settings-toggle-secret") {
             const targetId = String(actionNode.dataset.target || "").trim();
             const input = targetId && panelShadowRoot ? panelShadowRoot.getElementById(targetId) : null;
@@ -1630,10 +1641,24 @@ function renderSummary(panel) {
 
     const isFresh = appState.sessionGeneratedTasks.has("summary") || appState.sessionGeneratedTasks.has("segments");
     const cacheTag = buildCacheTagHtml(appState.cache, ["summary", "segments"], hasContent, isLoading, isFresh);
+    const showModeNotice = !appState.settings?.summaryModeNoticeSeen && !isFresh;
+    const isFastMode = (appState.settings?.prefMode || "efficiency") === "quality";
+    const modeNoticeHtml = showModeNotice ? `
+        <div class="summary-mode-notice">
+            <div class="summary-mode-notice-text">
+                <strong>当前为「${isFastMode ? "高速模式" : "省流模式"}」</strong>
+                <span>${isFastMode
+                    ? "会同时生成总结和分段，速度更快，但每次会消耗 2 次模型调用次数，你可以在设置中切换。"
+                    : "本次会消耗 1 次模型调用，同时生成总结和分段。速度较慢、更省次数，你可以在设置中切换。"}</span>
+            </div>
+            <button type="button" class="summary-mode-notice-btn" data-action="summary-mode-notice-dismiss">知道了</button>
+        </div>
+    ` : "";
     const headerHtml = `
         <div class="page-header">
             <h3>总结 <div class="header-tags">${cacheTag}</div></h3>
         </div>
+        ${modeNoticeHtml}
     `;
 
     if (!isLoading && (!hasContent || isTranscriptionRunning())) {
@@ -1673,9 +1698,11 @@ function renderSummary(panel) {
 
     const summarySkeleton = renderSkeletonLines(4, "summary-skeleton");
     const segmentsSkeleton = renderSkeletonLines(5, "segments-skeleton");
-    const summaryBody = isLoading
-        ? summarySkeleton
-        : (summary ? `<div class="result-text summary-result-text">${renderRichContent(summary)}</div>` : `<div class="empty-text">尚未生成总结</div>`);
+    const summaryIsLoading = summaryStatus === "processing";
+    const segmentsIsLoading = segmentsStatus === "processing";
+    const summaryBody = summary
+        ? `<div class="result-text summary-result-text">${renderRichContent(summary)}</div>`
+        : (summaryIsLoading ? summarySkeleton : `<div class="empty-text">尚未生成总结</div>`);
     
     const copyIconSrc = chrome.runtime.getURL(`${UI_ICON_BASE_DIR}/default/copy2.png`);
     const refreshIconSrc = chrome.runtime.getURL(`${UI_ICON_BASE_DIR}/default/refresh.png`);
@@ -1691,7 +1718,7 @@ function renderSummary(panel) {
         <polyline points="6 9 12 15 18 9"></polyline>
     </svg>`;
 
-    const hasSegments = segments.length > 0 || isLoading;
+    const hasSegments = segments.length > 0 || segmentsIsLoading;
     const toggleBtn = hasSegments ? `
         <button class="segments-toggle-btn ${isExpanded ? "is-expanded" : ""}"
                 data-action="summary-expand"
@@ -1700,10 +1727,8 @@ function renderSummary(panel) {
         </button>
     ` : "";
 
-    const segmentListHtml = isLoading
-        ? segmentsSkeleton
-        : (segments.length
-            ? `<div class="segment-list">${segments.map((item) => `
+    const segmentListHtml = segments.length
+        ? `<div class="segment-list">${segments.map((item) => `
                 <button class="segment-card ${item.type === "ad" ? "ad" : ""}"
                         data-action="segment-jump" data-start="${item.start}">
                     <span class="seg-time">${formatTime(item.start)}-${formatTime(item.end)}</span>
@@ -1711,7 +1736,9 @@ function renderSummary(panel) {
                     ${item.type === "ad" ? '<span class="ad-tag">广告片段</span>' : ""}
                 </button>`).join("")}
               </div>`
-            : `<div class="empty-text">尚未生成分段</div>`);
+        : (segmentsIsLoading
+        ? segmentsSkeleton
+        : `<div class="empty-text">尚未生成分段</div>`);
 
     panel.innerHTML = `
         <div class="page-header">
@@ -2719,7 +2746,7 @@ function renderSettings(panel) {
     const customPromptVisible = promptMode === "custom" ? "" : "settings-hidden";
     panel.innerHTML = `
         <div class="page-header">
-            <h3>Settings</h3>
+            <h3>设置（自动保存）</h3>
             <div id="save-status"></div>
         </div>
         <div class="settings-scroll-body">
@@ -2843,11 +2870,11 @@ function renderSettings(panel) {
                 <div class="settings-group-title">调用与显示模式</div>
                 <label class="settings-label-with-info">
                     <span>调用模式</span>
-                    <span class="settings-info-icon" data-tooltip="质量：总结和分段分别生成，更准但更慢。节流：一次生成总结+分段，更省次数。">i</span>
+                    <span class="settings-info-icon" data-tooltip="高速：总结和分段分别调用，速度更快但消耗 2 次。省流：一次调用同时生成总结和分段，更省次数。">i</span>
                 </label>
                 ${renderCustomSelect("settings-pref-mode", [
-                    { value: "quality", label: "质量模式" },
-                    { value: "efficiency", label: "节流模式" }
+                    { value: "quality", label: "高速模式" },
+                    { value: "efficiency", label: "省流模式" }
                 ], settings.prefMode === "quality" ? "quality" : "efficiency")}
                 <label>默认开屏页</label>
                 ${renderCustomSelect("settings-default-open-page", [

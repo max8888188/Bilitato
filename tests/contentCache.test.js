@@ -29,6 +29,7 @@ describe("contentCache", () => {
 
     expect(html).toContain("cloud-cache-tag");
     expect(html).toContain("云端缓存");
+    expect(html).toContain("该视频已有云端缓存内容，不消耗调用次数");
     expect(html).toContain("模型: gpt-test");
     expect(html).toContain("上传: 2026-05-12 08:00:00 UTC+8");
   });

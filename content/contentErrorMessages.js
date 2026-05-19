@@ -51,7 +51,7 @@
         },
         JSON_PARSE_ERROR: {
             title: "模型返回格式异常",
-            message: "模型没有按预期格式返回结果，请重试，或切换到质量模式/其他模型。",
+            message: "模型没有按预期格式返回结果，请重试，或切换到高速模式/其他模型。",
             actionText: "重试",
             action: "retry",
             presentation: "panel"

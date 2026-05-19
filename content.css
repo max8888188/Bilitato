@@ -1947,6 +1947,48 @@ input[type="range"]:active::-webkit-slider-thumb {
     line-height: 1.55;
 }
 
+.summary-mode-notice {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    margin: 0 0 8px 0;
+    padding: 8px 10px;
+    border-radius: 8px;
+    background: rgba(251, 114, 153, 0.08);
+    border: 1px solid rgba(251, 114, 153, 0.16);
+}
+
+.summary-mode-notice-text {
+    min-width: 0;
+    display: grid;
+    gap: 3px;
+    color: #6b2b43;
+    font-size: 11px;
+    line-height: 1.45;
+}
+
+.summary-mode-notice-text strong {
+    color: #2f3542;
+    font-size: 12px;
+}
+
+.summary-mode-notice-btn {
+    flex: 0 0 auto;
+    border: 0;
+    border-radius: 7px;
+    background: #fb7299;
+    color: #fff;
+    height: 26px;
+    padding: 0 10px;
+    font-size: 11px;
+    cursor: pointer;
+}
+
+.summary-mode-notice-btn:hover {
+    background: #e7688f;
+}
+
 .cache-tag {
     display: inline-flex;
     align-items: center;

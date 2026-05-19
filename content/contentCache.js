@@ -24,6 +24,7 @@
             || ""
         );
         const lines = [];
+        lines.push("该视频已有云端缓存内容，不消耗调用次数");
         if (models.length) lines.push(`模型: ${models.join(" / ")}`);
         if (uploadedAt) lines.push(`上传: ${uploadedAt}`);
         return lines.join("\n");

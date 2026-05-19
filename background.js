@@ -2204,6 +2204,18 @@ async function runSummarySegmentsInQuality(tabId, bvid, force, settings, taskCon
     const guided = settings.promptSettings?.guided || {};
     const customPrompts = settings.promptSettings?.custom || {};
     const results = createSummarySegmentsResult();
+    async function writeStreamingSummaryPartial(text, state, forceWrite = false) {
+        const value = String(text || "").trim();
+        if (!value) return;
+        const now = Date.now();
+        if (!forceWrite && now - Number(state.lastWriteAt || 0) < 350) return;
+        state.lastWriteAt = now;
+        await mergeCacheByBvid(bvid, {
+            summary: value,
+            summaryCacheSource: "local",
+            updatedAt: now
+        });
+    }
     const summaryExists = !force && String(cache?.summary || "").trim();
     const segmentsExists = !force && Array.isArray(cache?.segments) && cache.segments.length > 0;
     if (summaryExists || segmentsExists) {
@@ -2248,9 +2260,21 @@ async function runSummarySegmentsInQuality(tabId, bvid, force, settings, taskCon
                         pref_mode: settings.prefMode || ""
                     }
                 });
-                const aiRes = await callAIWithTimeout(settings, [{ role: "user", content: summaryPrompt }], TASK_TIMEOUT_MS, { bypassQueue: true });
+                let streamedSummaryText = "";
+                let partialWritePromise = Promise.resolve();
+                const partialState = { lastWriteAt: 0 };
+                const aiRes = await callAIWithTimeoutStream(settings, [{ role: "user", content: summaryPrompt }], TASK_TIMEOUT_MS, (delta) => {
+                    const chunk = String(delta || "");
+                    if (!chunk) return;
+                    streamedSummaryText += chunk;
+                    partialWritePromise = partialWritePromise
+                        .catch(() => {})
+                        .then(() => writeStreamingSummaryPartial(streamedSummaryText, partialState, false));
+                });
+                await partialWritePromise.catch(() => {});
                 const summaryText = String(aiRes.text || "").trim();
                 if (!summaryText) throw new Error("总结生成为空");
+                await writeStreamingSummaryPartial(summaryText, partialState, true);
                 logSummaryQualitySummary(bvid, summaryText, {
                     subtitleChars: subtitleText.length,
                     promptChars: summaryPrompt.length,
