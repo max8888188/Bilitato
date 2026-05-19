@@ -1,9 +1,10 @@
 {
   "name": "bilitato",
-  "version": "1.0.0",
+  "version": "1.2.2",
   "private": true,
   "type": "module",
   "scripts": {
+    "build:release": "node scripts/build-release.js",
     "test": "vitest run",
     "test:watch": "vitest"
   },

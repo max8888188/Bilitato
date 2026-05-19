@@ -2973,6 +2973,12 @@ input[type="range"]:active::-webkit-slider-thumb {
     animation: release-card-pop 0.2s ease forwards;
 }
 
+.release-notice-content {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+}
+
 .release-notice-close {
     position: absolute;
     top: 8px;
@@ -3095,6 +3101,35 @@ input[type="range"]:active::-webkit-slider-thumb {
     justify-content: flex-end;
     gap: 6px;
     margin-top: 2px;
+}
+
+.release-notice-pager {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+    min-height: 24px;
+}
+
+.release-notice-page-btn {
+    border: 1px solid #e3e8ec;
+    border-radius: 999px;
+    background: #fff;
+    color: #4c5566;
+    font-size: 11px;
+    height: 24px;
+    padding: 0 10px;
+    cursor: pointer;
+}
+
+.release-notice-page-btn:disabled {
+    opacity: 0.4;
+    cursor: default;
+}
+
+.release-notice-page-count {
+    color: #9499a0;
+    font-size: 11px;
 }
 
 .release-notice-secondary {
