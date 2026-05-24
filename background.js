@@ -2392,7 +2392,7 @@ async function requestTaskResult(bvid, task, settings, taskContext = {}) {
     await appendMetrics(bvid, null, task, aiRes.metrics);
     await reportFeatureUsage(task, bvid, settings, aiRes.metrics);
     if (task === "summary") {
-        return aiRes.text.trim();
+        return sanitizeSummaryOutput(aiRes.text);
     }
     if (task === "segments") {
         const parsed = robustJSONParse(aiRes.text);
@@ -2423,6 +2423,25 @@ function createSummarySegmentsResult() {
         summary: { ok: false, data: null, error: null },
         segments: { ok: false, data: null, error: null }
     };
+}
+
+function sanitizeSummaryOutput(text) {
+    let value = String(text || "").trim();
+    if (!value) return "";
+    value = value
+        .replace(/<<<\s*SUMMARY_START\s*>>>/gi, "")
+        .replace(/<<<\s*SUMMARY_END\s*>>>/gi, "")
+        .replace(/<<<\s*SEGMENTS_START\s*>>>[\s\S]*$/gi, "")
+        .replace(/【\s*SUMMARY_START\s*】/gi, "")
+        .replace(/【\s*SUMMARY_END\s*】/gi, "")
+        .trim();
+    const firstBoldHeading = value.search(/\*\*[^*\n]{2,40}\*\*/);
+    const leading = firstBoldHeading > 0 ? value.slice(0, firstBoldHeading) : "";
+    const hasPlanningPreamble = /让我|我将|需要输出|下面(?:是|为)|根据字幕|视频的核心观点|先来分析|我来梳理/.test(leading);
+    if (hasPlanningPreamble) {
+        value = value.slice(firstBoldHeading).trim();
+    }
+    return value;
 }
 
 function resolveStatusByError(error) {
@@ -2574,7 +2593,7 @@ async function runSummarySegmentsInQuality(tabId, bvid, force, settings, taskCon
                         .then(() => writeStreamingSummaryPartial(streamedSummaryText, partialState, false));
                 }, null, { tabId });
                 await partialWritePromise.catch(() => {});
-                const summaryText = String(aiRes.text || streamedSummaryText || "").trim();
+                const summaryText = sanitizeSummaryOutput(aiRes.text || streamedSummaryText);
                 if (!summaryText) {
                     logAI.error("summary_empty", {
                         bvid,
@@ -2802,7 +2821,7 @@ async function runSummarySegmentsInEfficiency(tabId, bvid, force, settings, task
             if (summaryApplied) return;
             const section = extractProtocolSection(streamBuffer, "<<<SUMMARY_START>>>", "<<<SUMMARY_END>>>");
             if (!section.found) return;
-            const summaryText = section.content.trim();
+            const summaryText = sanitizeSummaryOutput(section.content);
             if (!summaryText) return;
             summaryApplied = true;
             results.summary = { ok: true, data: summaryText, error: null };
@@ -2821,7 +2840,7 @@ async function runSummarySegmentsInEfficiency(tabId, bvid, force, settings, task
         });
         const summarySection = extractProtocolSection(fullText, "<<<SUMMARY_START>>>", "<<<SUMMARY_END>>>");
         if (!results.summary.ok && summarySection.found) {
-            const summaryText = summarySection.content.trim();
+            const summaryText = sanitizeSummaryOutput(summarySection.content);
             if (summaryText) {
                 results.summary = { ok: true, data: summaryText, error: null };
                 await applySummarySegmentsResults(tabId, bvid, { summary: results.summary }, { keepProcessingTasks: ["segments"] });
@@ -2863,6 +2882,61 @@ async function runSummarySegmentsInEfficiency(tabId, bvid, force, settings, task
                         subtitlePayload: getSubtitlePayloadMeta(cache, subtitleText, subtitlePayloadOptions)
                     });
                 }
+            }
+        }
+        if (!segmentsResolved) {
+            try {
+                const fallbackPrompt = isSegmentPromptTestEnabled(settings)
+                    ? buildSegmentsAdTestPrompt({ subtitle: subtitleText, taskContext: promptTaskContext })
+                    : buildPrompt({ type: "segments", subtitle: subtitleText, mode, guided, customPrompts, taskContext: promptTaskContext });
+                logAI.warn("segments_merged_parse_fallback_start", {
+                    bvid,
+                    task: "segments",
+                    provider: settings.provider,
+                    model: settings.model || "",
+                    detail: {
+                        mode: "efficiency",
+                        prompt_chars: fallbackPrompt.length,
+                        merged_output_chars: fullText.length
+                    }
+                });
+                const fallbackRes = await callAIWithTimeout(settings, [{ role: "user", content: fallbackPrompt }], TASK_TIMEOUT_MS, { bypassQueue: true, tabId });
+                const parsed = robustJSONParse(fallbackRes.text);
+                const cache = await getCache(bvid);
+                const normalized = normalizeSegments(parsed, cache, { bvid, task: "segments", mode: "efficiency_fallback" });
+                if (normalized.length) {
+                    results.segments = { ok: true, data: normalized, error: null };
+                    segmentsResolved = true;
+                    logSegmentQualitySummary(bvid, normalized, cache, {
+                        task: "segments",
+                        mode: "efficiency_fallback",
+                        subtitlePayload: getSubtitlePayloadMeta(cache, subtitleText, subtitlePayloadOptions)
+                    });
+                    await appendMetrics(bvid, null, "segments", fallbackRes.metrics);
+                    await reportFeatureUsage("segments", bvid, settings, fallbackRes.metrics);
+                    logAI.info("segments_merged_parse_fallback_success", {
+                        bvid,
+                        task: "segments",
+                        provider: settings.provider,
+                        model: settings.model || "",
+                        duration_ms: fallbackRes.metrics?.latencyMs || 0,
+                        detail: {
+                            mode: "efficiency_fallback",
+                            output_chars: String(fallbackRes.text || "").length,
+                            segment_count: normalized.length
+                        }
+                    });
+                }
+            } catch (fallbackError) {
+                logAI.warn("segments_merged_parse_fallback_failed", buildFailureLog(fallbackError, {
+                    task: "segments",
+                    bvid,
+                    provider: settings.provider,
+                    model: settings.model || "",
+                    detail: {
+                        mode: "efficiency_fallback"
+                    }
+                }));
             }
         }
         if (!segmentsResolved) {

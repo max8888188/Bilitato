@@ -49,31 +49,56 @@ function isLineIdField(key) {
     return /line/i.test(String(key || ""));
 }
 
+function unwrapSegmentList(value) {
+    if (Array.isArray(value)) return value;
+    if (!value || typeof value !== "object") return [];
+    const candidates = [
+        value.segments,
+        value.chapters,
+        value.sections,
+        value.items,
+        value.data,
+        value.result,
+        value.分段,
+        value.章节
+    ];
+    for (const candidate of candidates) {
+        if (Array.isArray(candidate)) return candidate;
+        if (candidate && typeof candidate === "object") {
+            const nested = unwrapSegmentList(candidate);
+            if (nested.length) return nested;
+        }
+    }
+    return [];
+}
+
 export function normalizeSegments(value, hooks = {}) {
-    if (!Array.isArray(value)) return [];
+    const sourceList = unwrapSegmentList(value);
+    if (!Array.isArray(sourceList) || !sourceList.length) return [];
     const allowLineOnly = hooks?.allowLineOnly === true;
-    const startFuzzyMatchers = [/start/, /^from$/, /begin/, /tsstart/, /timestart/];
-    const endFuzzyMatchers = [/end/, /^to$/, /finish/, /tsend/, /timeend/];
-    const labelPrimaryFuzzyMatchers = [/label/, /title/, /name/, /chapter/, /heading/, /topic/];
-    const labelFallbackFuzzyMatchers = [/summary/, /content/, /desc/, /description/, /outline/];
+    const startFuzzyMatchers = [/start/, /^from$/, /begin/, /tsstart/, /timestart/, /开始/, /起始/];
+    const endFuzzyMatchers = [/end/, /^to$/, /finish/, /tsend/, /timeend/, /结束/, /截止/];
+    const labelPrimaryFuzzyMatchers = [/label/, /title/, /name/, /chapter/, /heading/, /topic/, /标题/, /章节/, /主题/];
+    const labelFallbackFuzzyMatchers = [/summary/, /content/, /desc/, /description/, /outline/, /概述/, /内容/, /说明/];
     const dropped = [];
     const fuzzyHits = [];
-    const mapped = value
+    const mapped = sourceList
         .map((item, index) => {
-            const startField = resolveSegmentField(item, ["start", "start_time", "time_start"], startFuzzyMatchers);
-            const endField = resolveSegmentField(item, ["end", "end_time", "time_end"], endFuzzyMatchers);
-            let labelField = resolveSegmentField(item, ["label", "title", "name"], labelPrimaryFuzzyMatchers);
+            const startField = resolveSegmentField(item, ["start", "start_time", "time_start", "开始", "开始时间"], startFuzzyMatchers);
+            const endField = resolveSegmentField(item, ["end", "end_time", "time_end", "结束", "结束时间"], endFuzzyMatchers);
+            let labelField = resolveSegmentField(item, ["label", "title", "name", "标题", "章节标题"], labelPrimaryFuzzyMatchers);
             if (!hasUsableSegmentValue(labelField.value)) {
-                labelField = resolveSegmentField(item, ["summary", "content"], labelFallbackFuzzyMatchers);
+                labelField = resolveSegmentField(item, ["summary", "content", "概述", "内容"], labelFallbackFuzzyMatchers);
             }
             const start = parseTimeToSeconds(startField.value);
             const end = parseTimeToSeconds(endField.value);
             const label = String(labelField.value || "").trim();
-            const type = item?.type === "ad" ? "ad" : "content";
-            const startLine = Number(item?.start_line ?? item?.startLine ?? item?.line_start ?? item?.lineStart);
-            const endLine = Number(item?.end_line ?? item?.endLine ?? item?.line_end ?? item?.lineEnd);
-            const adStartLine = Number(item?.ad_start_line ?? item?.adStartLine ?? item?.start_line ?? item?.startLine);
-            const adEndLine = Number(item?.ad_end_line ?? item?.adEndLine ?? item?.end_line ?? item?.endLine);
+            const rawType = String(item?.type ?? item?.类型 ?? item?.kind ?? "").toLowerCase();
+            const type = rawType === "ad" || rawType.includes("广告") ? "ad" : "content";
+            const startLine = Number(item?.start_line ?? item?.startLine ?? item?.line_start ?? item?.lineStart ?? item?.开始行 ?? item?.起始行);
+            const endLine = Number(item?.end_line ?? item?.endLine ?? item?.line_end ?? item?.lineEnd ?? item?.结束行);
+            const adStartLine = Number(item?.ad_start_line ?? item?.adStartLine ?? item?.start_line ?? item?.startLine ?? item?.广告开始行 ?? item?.开始行);
+            const adEndLine = Number(item?.ad_end_line ?? item?.adEndLine ?? item?.end_line ?? item?.endLine ?? item?.广告结束行 ?? item?.结束行);
             const primaryStartLine = type === "ad" && Number.isInteger(adStartLine) ? adStartLine : startLine;
             const primaryEndLine = type === "ad" && Number.isInteger(adEndLine) ? adEndLine : endLine;
             const hasLineRange = Number.isInteger(primaryStartLine) && primaryStartLine >= 0
@@ -132,10 +157,10 @@ export function normalizeSegments(value, hooks = {}) {
         })
         .filter(Boolean);
     if (fuzzyHits.length && typeof hooks.onFuzzyHit === "function") {
-        hooks.onFuzzyHit(fuzzyHits, value.length);
+        hooks.onFuzzyHit(fuzzyHits, sourceList.length);
     }
     if (dropped.length && typeof hooks.onDrop === "function") {
-        hooks.onDrop(dropped, value.length);
+        hooks.onDrop(dropped, sourceList.length);
     }
     mapped.sort((a, b) => a.start - b.start);
     return mapped;

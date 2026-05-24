@@ -1380,6 +1380,8 @@ function updateProgress(percent, taskId, options) {
         same_task: sameTask,
         has_active_task: hasActiveTask,
         options: opts,
+        task_status: appState.tabState?.taskStatus || {},
+        last_error: appState.tabState?.lastError || "",
         session: {
             active: !!appState.asrSession?.active,
             bvid: appState.asrSession?.bvid || "",

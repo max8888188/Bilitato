@@ -26,6 +26,31 @@ describe("normalizeSegments", () => {
     ]);
   });
 
+  it("unwraps provider responses that nest segments in an object", () => {
+    const result = normalizeSegments({
+      summary: "ignored",
+      segments: [
+        { start: 0, end: 10, label: "对象包裹段落", type: "content" }
+      ]
+    });
+
+    expect(result).toEqual([
+      { start: 0, end: 10, label: "对象包裹段落", type: "content" }
+    ]);
+  });
+
+  it("accepts Chinese segment field names from non-standard providers", () => {
+    const result = normalizeSegments({
+      章节: [
+        { 开始时间: "00:10", 结束时间: "00:30", 标题: "中文字段", 类型: "广告", 开始行: 2, 结束行: 6 }
+      ]
+    });
+
+    expect(result).toEqual([
+      { start: 10, end: 30, label: "中文字段", type: "ad", start_line: 2, end_line: 6, ad_start_line: 2, ad_end_line: 6 }
+    ]);
+  });
+
   it("drops invalid segments", () => {
     const result = normalizeSegments([
       { start: 10, end: 5, label: "结束早于开始" },

@@ -61,7 +61,8 @@ describe("providerAdapter", () => {
     expect(JSON.parse(init.body)).toMatchObject({
       model: "openrouter/auto",
       messages: [{ role: "user", content: "hello" }],
-      stream: false
+      stream: false,
+      reasoning: { effort: "none", exclude: true }
     });
   });
 

@@ -118,6 +118,12 @@ function isClaudeRequest(req) {
     return req?.provider?.type === "claude" || (req?.isCustom && req?.protocol === "claude");
 }
 
+function isOpenRouterProvider(providerKey, config, provider, baseUrl) {
+    const key = String(providerKey || config?.provider || "").toLowerCase();
+    const url = String(baseUrl || provider?.baseUrl || "").toLowerCase();
+    return key === "openrouter" || url.includes("openrouter.ai");
+}
+
 function normalizeTextContent(content) {
     if (Array.isArray(content)) {
         return content.map((item) => {
@@ -264,6 +270,7 @@ function resolveProviderRequest(providerKey, config, messages, streaming) {
         const qwenModel = isQwenModel(model);
         const jsonMode = shouldUseJsonResponseFormat(messages);
         const normalizedMessages = qwenModel && jsonMode ? appendJsonFormatHint(messages) : messages;
+        const isOpenRouter = isOpenRouterProvider(providerKey, config, provider, baseUrl);
         body = {
             model: model,
             messages: normalizedMessages,
@@ -271,6 +278,9 @@ function resolveProviderRequest(providerKey, config, messages, streaming) {
             max_tokens: 4096,
             stream: !!streaming
         };
+        if (isOpenRouter) {
+            body.reasoning = { effort: "none", exclude: true };
+        }
         if (streaming && shouldIncludeStreamUsage(providerKey || config.provider, isCustom, protocol)) {
             body.stream_options = { include_usage: true };
         }
