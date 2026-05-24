@@ -486,13 +486,20 @@ export function buildCompactSegmentsPrompt({
     const noTimestampRule = buildNoTimestampTaskRule("segments", taskContext);
     const subtitleBlock = `【字幕内容】\n${subtitle}`.trim();
     return [
-        "你是一个 B 站视频章节分段助手。现在必须使用极简格式重新生成。",
+        "你是一个 B 站视频章节分段助手，同时你需要识别广告。现在必须使用极简格式重新生成。",
         "【核心要求】",
         "- 严禁逐句分段，必须按章节级内容分段。",
         "- 10 分钟以内输出 4-7 段；10-25 分钟输出 6-10 段；25-45 分钟输出 8-12 段；45 分钟以上输出 10-16 段。",
         "- 每个 label 控制在 8-16 个中文字，必须概括本段核心事件或观点，不要只写泛化词。",
         "- 必须覆盖从第一行到最后一行字幕，最后一段 end_line 必须接近最后一个 #编号。",
         "- 如果有广告，type 写 \"ad\"；普通内容 type 写 \"content\"。",
+        "【广告要求】",
+        "- 广告通常具有以下特征：",
+        "- 博主从讲述视频内容转为推荐产品或服务",
+        "- 出现品牌介绍、购买、下载、注册链接、优惠等内容",
+        "- 出现感谢赞助 / 本期视频由…支持 / 推荐大家试试",
+        "- 视频主线突然中断，插入与主题无关的推广",
+        "- 广告段必须输出 ad_start_line 和 ad_end_line，通常它们应与 start_line/end_line 相同。",
         "【极简输出格式】",
         "只输出 JSON 数组，不要 Markdown，不要解释，不要代码块。",
         "普通段只允许字段：{\"start_line\":0,\"end_line\":50,\"label\":\"背景铺垫\",\"type\":\"content\"}",
