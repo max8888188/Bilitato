@@ -1000,8 +1000,11 @@ function onStorageChanged(changes, areaName) {
     const afterBvid = normalizeBvidCase(appState.tabState?.activeBvid);
     const activeCid = Number(appState.tabState?.activeCid || 0);
     const routeMismatch = !!(routeBvid && afterBvid && String(afterBvid) !== routeBvid);
+    const runningBvid = normalizeBvidCase(appState.asrSession?.bvid || getTranscriptionBvid() || "");
     const switched = !!(beforeBvid && afterBvid && beforeBvid !== afterBvid);
-    if (switched) {
+    const switchedIntoRunningBvid = !!(switched && runningBvid && afterBvid === runningBvid);
+    const shouldResetForSwitch = switched && !switchedIntoRunningBvid;
+    if (shouldResetForSwitch) {
         pushSubtitleTimeline("bvid_switch", { from: beforeBvid, to: afterBvid || "" });
         resetPageStateByBvidSwitch();
         clearStreamCache();
@@ -1011,7 +1014,7 @@ function onStorageChanged(changes, areaName) {
         clearCCListImmediately();
     }
     const candidateCacheKeys = [...new Set([beforeBvid, afterBvid, routeBvid].filter(Boolean).map((bvid) => `cache_${bvid}`))];
-    if (!switched && !routeMismatch) {
+    if (!shouldResetForSwitch && !routeMismatch) {
         const currentRoute = normalizeBvidCase(getBvidFromUrl(location.href));
         const nextCache = candidateCacheKeys
             .map((key) => changes[key]?.newValue)
@@ -1044,7 +1047,7 @@ function onStorageChanged(changes, areaName) {
         appState.injectBvidChangedAt = Date.now();
         startSubtitleCheckTimer();
     }
-    if (isStorageChangeStateDirty(changes, switched, routeMismatch, afterBvid)) {
+    if (isStorageChangeStateDirty(changes, shouldResetForSwitch, routeMismatch, afterBvid)) {
         appState.isStateDirty = true;
     }
     if (Number.isFinite(activeCid) && activeCid > 0) appState.injectCid = activeCid;
@@ -1053,7 +1056,7 @@ function onStorageChanged(changes, areaName) {
     renderContent();
     const tabStateChanged = tabStateBefore !== appState.tabState;
     const syncTarget = routeBvid || afterBvid || "";
-    if ((tabStateChanged || switched || routeMismatch) && syncTarget && !changes[`cache_${syncTarget}`]?.newValue) {
+    if ((tabStateChanged || shouldResetForSwitch || routeMismatch) && syncTarget && !changes[`cache_${syncTarget}`]?.newValue) {
         syncActiveCacheByBvid(syncTarget);
     }
 }
@@ -2840,7 +2843,11 @@ function bindSummaryResizeDivider(panel) {
 }
 
 function renderCC(panel, rowsOverride) {
-    const currentBvid = normalizeBvidCase(appState.tabState?.activeBvid || getBvidFromUrl(location.href) || "");
+    const transcription = getTranscriptionState();
+    const sessionBvid = normalizeBvidCase(appState.asrSession?.active ? appState.asrSession?.bvid : "");
+    const transcriptionBvid = normalizeBvidCase(transcription.phase === "running" ? transcription.bvid : "");
+    const routeOrStateBvid = normalizeBvidCase(resolveCurrentBvid() || appState.injectBvid || appState.tabState?.activeBvid || "");
+    const currentBvid = sessionBvid || transcriptionBvid || routeOrStateBvid;
     const cacheBvid = normalizeBvidCase(appState.cache?.bvid || "");
     const cacheReadyForCurrent = !!currentBvid && cacheBvid === currentBvid;
     const rows = Array.isArray(rowsOverride) ? rowsOverride : (cacheReadyForCurrent ? getRawSubtitleRowsFromCache(appState.cache) : []);
@@ -2856,8 +2863,6 @@ function renderCC(panel, rowsOverride) {
         });
     }
     const subtitleSource = String(appState.tabState?.subtitleSource || "");
-
-    const transcription = getTranscriptionState();
 
     const currentBvidForProgress = normalizeBvidCase(currentBvid || getStableCurrentBvid() || "");
     const tabStateBvidForProgress = normalizeBvidCase(appState.tabState?.activeBvid || "");
@@ -4294,27 +4299,66 @@ function renderSegmentPromptDebugControls() {
 
 function renderTaskRetryDebugPanel() {
     const retryState = appState.tabState?.taskRetryState?.segments || null;
+    const taskStatus = String(appState.tabState?.taskStatus?.segments || "idle");
+    const taskError = appState.tabState?.taskErrors?.segments || null;
+    const events = Array.isArray(retryState?.events) ? retryState.events : [];
     const strategyMap = {
+        merged: "省流联合请求",
         primary: "原 Prompt 重试",
         compact: "保守 Prompt 重试"
+    };
+    const statusMap = {
+        idle: "空闲",
+        processing: "处理中",
+        done: "完成",
+        error: "失败",
+        timeout: "超时",
+        running: "运行中",
+        retrying: "重试中",
+        retry_failed: "重试失败",
+        recovered: "已恢复"
     };
     const strategyLabel = strategyMap[String(retryState?.strategy || "")] || "未重试";
     const code = String(retryState?.code || "");
     const mode = String(retryState?.mode || "");
+    const stage = String(retryState?.stage || "");
+    const updatedAt = Number(retryState?.updatedAt || 0);
+    const updatedText = updatedAt ? new Date(updatedAt).toLocaleTimeString() : "-";
+    const eventListHtml = events.length
+        ? `<div class="debug-state-preview" style="margin-top:8px;">${events.map((item) => {
+            const at = Number(item?.at || 0);
+            const time = at ? new Date(at).toLocaleTimeString() : "--:--:--";
+            return `<div style="margin-bottom:6px;"><strong>${escapeHtml(time)}</strong> · ${escapeHtml(String(item?.text || ""))}</div>`;
+        }).join("")}</div>`
+        : `<div class="empty-text" style="margin-top:8px;">当前还没有分段阶段事件。</div>`;
     return `
         <div class="settings-group-title">分段自动重试状态</div>
         <div class="error-demo-section">
-            ${retryState ? `
-                <div class="debug-state-preview">
-                    <div><strong>状态：</strong>自动重试中</div>
-                    <div><strong>阶段：</strong>${escapeHtml(strategyLabel)}</div>
-                    <div><strong>次数：</strong>第 ${Number(retryState.attempt || 0)}/${Number(retryState.total || 0)} 次</div>
-                    <div><strong>触发错误：</strong>${escapeHtml(code || "-")}</div>
-                    <div><strong>任务模式：</strong>${escapeHtml(mode || "-")}</div>
-                </div>
-            ` : `
-                <div class="empty-text">当前没有正在进行的分段自动重试。</div>
-            `}
+            <button type="button" class="panel-btn ghost" data-action="debug-run-segments-retry-test">触发分段自动重试测试</button>
+            <div class="debug-state-preview" style="margin-top:8px;">
+                <div><strong>任务状态：</strong>${escapeHtml(statusMap[taskStatus] || taskStatus)}</div>
+                <div><strong>运行阶段：</strong>${escapeHtml(statusMap[String(retryState?.status || "")] || String(retryState?.status || "未开始"))}</div>
+                <div><strong>当前策略：</strong>${escapeHtml(strategyLabel)}</div>
+                <div><strong>内部阶段：</strong>${escapeHtml(stage || "-")}</div>
+                <div><strong>次数：</strong>${retryState ? `第 ${Number(retryState.attempt || 0)}/${Number(retryState.total || 0)} 次` : "-"}</div>
+                <div><strong>触发错误：</strong>${escapeHtml(code || String(taskError?.code || "-"))}</div>
+                <div><strong>任务模式：</strong>${escapeHtml(mode || "-")}</div>
+                <div><strong>当前文案：</strong>${escapeHtml(String(retryState?.message || "-"))}</div>
+                <div><strong>分段数量：</strong>${Number(retryState?.segmentCount || 0) || (Array.isArray(appState.cache?.segments) ? appState.cache.segments.length : 0)}</div>
+                <div><strong>最后更新：</strong>${escapeHtml(updatedText)}</div>
+            </div>
+            <div class="error-demo-label">最近阶段事件</div>
+            ${eventListHtml}
+        </div>
+    `;
+}
+
+function renderUserFacingSummaryPreviewSection() {
+    return `
+        <div class="settings-group-title">用户前台实时预览</div>
+        <div class="error-demo-section">
+            <div class="empty-text" style="margin-bottom:8px;">下面这块直接复用总结页真实渲染，用来观察用户实际会看到的分段界面。</div>
+            <div id="debug-summary-preview" class="debug-summary-preview"></div>
         </div>
     `;
 }
@@ -4334,6 +4378,7 @@ function renderDebugPanel(panel) {
         </div>
         <div class="page-body debug-page-body">
             ${renderTaskRetryDebugPanel()}
+            ${renderUserFacingSummaryPreviewSection()}
             ${renderSegmentPromptDebugControls()}
             ${renderSubtitleEmptyDemoControls()}
             ${renderAsrUiTracePanel()}
@@ -4341,6 +4386,10 @@ function renderDebugPanel(panel) {
             ${renderRealtimeLogPanel()}
         </div>
     `;
+    const summaryPreview = panel.querySelector("#debug-summary-preview");
+    if (summaryPreview) {
+        renderSummary(summaryPreview);
+    }
     bindSegmentPromptDebugControls(panel);
     bindRealtimeLogPanel(panel);
     renderAsrUiTraceData();
@@ -4349,6 +4398,21 @@ function renderDebugPanel(panel) {
 }
 
 function bindSegmentPromptDebugControls(panel) {
+    const retryTestBtn = panel?.querySelector('[data-action="debug-run-segments-retry-test"]');
+    if (retryTestBtn) {
+        retryTestBtn.addEventListener("click", async () => {
+            retryTestBtn.disabled = true;
+            try {
+                clearPanelError("summary");
+                await runTasks(["segments"], { overrideAction: "RUN_SEGMENTS_RETRY_TEST" });
+                showToast("已触发分段自动重试测试");
+            } catch (error) {
+                showToast(error.message || "触发测试失败");
+            } finally {
+                retryTestBtn.disabled = false;
+            }
+        });
+    }
     const debugSelect = panel?.querySelector("#debug-mode-inline");
     if (debugSelect) {
         debugSelect.addEventListener("change", async () => {
@@ -4445,7 +4509,7 @@ function bindRealtimeLogPanel(panel) {
     });
 }
 
-async function runTasks(tasks) {
+async function runTasks(tasks, options = {}) {
     if (hasLocalPendingTasks(tasks)) return;
     setLocalPendingTasks(tasks, true);
     renderContent();
@@ -4483,9 +4547,13 @@ async function runTasks(tasks) {
         });
         startAsymptoticPseudoProgress(taskId, 12);
         const durationMeta = resolveVideoDurationMeta();
-        const taskContext = durationMeta ? { videoDuration: durationMeta } : {};
+        const taskContext = {
+            ...(durationMeta ? { videoDuration: durationMeta } : {}),
+            ...((options && typeof options === "object" && options.taskContext) ? options.taskContext : {})
+        };
+        const runtimeAction = String(options?.overrideAction || "RUN_TASKS");
         const res = await chrome.runtime.sendMessage({
-            action: "RUN_TASKS",
+            action: runtimeAction,
             tasks,
             force: true,
             bvid: normalizeBvidCase(resolveCurrentBvid() || ""),
@@ -6262,6 +6330,9 @@ async function startTranscriptionFromCapsule() {
     renderSubtitleTimelinePanel(document.getElementById("panel-body"));
     try {
         const freshPlayInfo = await ensureAsrPlayInfoForBvid(bvid).catch(() => null);
+        if (!hasUsablePlayInfoForBvid(freshPlayInfo, bvid)) {
+            throw { code: "ASR_PLAYINFO_NOT_FRESH", message: "当前视频信息还没刷新完成，请稍等 1-2 秒后重试" };
+        }
         const audioUrl = freshPlayInfo?.audio?.[0]?.url || "";
         logContent.info("asr_audio_payload_selected", {
             task: "asr",
@@ -6342,6 +6413,9 @@ async function handleRegenerateGroqSubtitle() {
     try {
         await chrome.runtime.sendMessage({ action: "CLEAR_SUBTITLE_CACHE", bvid: injectBvid });
         const freshPlayInfo = await ensureAsrPlayInfoForBvid(injectBvid).catch(() => null);
+        if (!hasUsablePlayInfoForBvid(freshPlayInfo, injectBvid)) {
+            throw { code: "ASR_PLAYINFO_NOT_FRESH", message: "当前视频信息还没刷新完成，请稍等 1-2 秒后重试" };
+        }
         const audioUrl = freshPlayInfo?.audio?.[0]?.url || "";
         const asrRunId = `asr_${injectBvid}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 7)}`;
         logContent.info("asr_regenerate_payload_prepared", {
@@ -7021,7 +7095,7 @@ async function ensureAsrPlayInfoForBvid(targetBvid) {
             playinfo_age_ms: Math.max(0, Date.now() - Number(fresh?._ts || appState.playInfo?._ts || 0))
         }
     });
-    return fresh || appState.playInfo || null;
+    return null;
 }
 
 function scheduleSubtitleFallbackWatchdog(source) {

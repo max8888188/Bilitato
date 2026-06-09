@@ -910,6 +910,19 @@ async function handleMessage(msg, sender) {
         await runTasksForTab(tabId, tasks, msg.force !== false, normalizeTaskContext(msg.taskContext), requestedBvid);
         return {};
     }
+    if (msg.action === "RUN_SEGMENTS_RETRY_TEST") {
+        if (!tabId) throw new Error("tabId 缺失");
+        const requestedBvid = normalizeBvid(msg.bvid);
+        logBackground.info("segments_retry_test_start", {
+            tab_id: tabId,
+            bvid: requestedBvid
+        });
+        await runTasksForTab(tabId, ["segments"], true, {
+            ...normalizeTaskContext(msg.taskContext),
+            debugForceFirstSegmentsFailure: true
+        }, requestedBvid);
+        return {};
+    }
     if (msg.action === "RUN_CHAT") {
         if (!tabId) throw new Error("tabId 缺失");
         const text = String(msg.text || "").trim();
@@ -1750,6 +1763,7 @@ class ContentProvider {
 
     static async extractAudioSourceFromTab(tabId, payload) {
         const provider = String(payload?.asrProvider || "").toLowerCase() === "siliconflow" ? "siliconflow" : "groq";
+        let identityMismatchError = null;
         // 优先按当前 tab 的 aid/cid 主动请求 B 站 playurl，避免 SPA 页面缓存音频串线。
         try {
             const result = await getCompatPlayUrlForTab(tabId, {
@@ -1779,6 +1793,7 @@ class ContentProvider {
                         expected_bvid: expectedBvid
                     }
                 });
+                identityMismatchError = createAppError("ASR_AUDIO_SOURCE_BVID_MISMATCH", "当前视频状态已变化，请等待页面刷新后重试");
             }
         } catch (error) {
             logASR.warn("asr_playurl_audio_fetch_failed", {
@@ -1791,6 +1806,8 @@ class ContentProvider {
                 }
             });
         }
+
+        if (identityMismatchError) throw identityMismatchError;
 
         // 降级使用 content.js 传来的音频地址。
         if (payload?.audioUrl) {
@@ -2392,14 +2409,14 @@ function makeSubtitleHash(list) {
     return `${list.length}|${first.start}|${last.end ?? last.start}|${first.text.slice(0, 24)}|${last.text.slice(0, 24)}`;
 }
 
-async function runTasksForTab(tabId, tasks, force, taskContext = {}, requestedBvid = "") {
+async function runTasksForTab(tabId, tasks, force, taskContext = {}, requestedBvid = "", settingsOverride = null) {
     const tabState = await getTabState(tabId);
     const bvid = normalizeBvid(requestedBvid || tabState?.activeBvid);
     if (!bvid) throw new Error("未获取到视频字幕");
     if (normalizeBvid(tabState?.activeBvid) !== bvid) {
         await updateTabState(tabId, { activeBvid: bvid, updatedAt: Date.now() });
     }
-    const resolvedSettings = await getResolvedSettings();
+    const resolvedSettings = settingsOverride || await getResolvedSettings();
     const hydrateTasks = [...new Set([
         ...tasks,
         ...(tasks.some((task) => ["summary", "segments", "rumors"].includes(task)) ? ["subtitle"] : [])
@@ -2719,6 +2736,56 @@ async function requestTaskResult(bvid, task, settings, taskContext = {}) {
             compact_segments: !!segmentPromptPlan?.compact
         }
     });
+    if (task === "segments") {
+        await recordSegmentsDebugState(taskContext?.tabId || null, {
+            status: "running",
+            stage: "primary_request",
+            strategy: segmentPromptPlan?.compact ? "compact" : "primary",
+            attempt: 0,
+            total: 2,
+            code: "",
+            mode: "single",
+            message: segmentPromptPlan?.compact ? "保守 Prompt 主请求生成中" : "原 Prompt 主请求生成中"
+        }, "开始分段主请求", { resetEvents: true });
+        if (consumeDebugForceFirstSegmentsFailure(taskContext)) {
+            const forcedError = attachSentryContext(
+                createAppError("SEGMENTS_INVALID_SCHEMA", "分段字段不完整"),
+                buildAIResponseSentryContext({
+                    task: "segments",
+                    bvid,
+                    provider: settings.provider,
+                    model: settings.model || "",
+                    mode: "single",
+                    source: "segments_single_forced_retry_test",
+                    responseText: "",
+                    metrics: {},
+                    extra: {
+                        debug_forced_failure: true
+                    }
+                })
+            );
+            await recordSegmentsDebugState(taskContext?.tabId || null, {
+                status: "retrying",
+                stage: "forced_failure",
+                mode: "single",
+                code: forcedError.code || "",
+                message: "测试模式：首轮主请求已强制失败"
+            }, "测试模式：首轮分段主请求强制失败，准备进入自动重试");
+            return await retrySegmentsWithAutoFallbacks({
+                tabId: taskContext?.tabId || null,
+                bvid,
+                cache,
+                settings,
+                taskContext,
+                subtitleText,
+                promptMode: settings.promptSettings?.mode || "guided",
+                guided: settings.promptSettings?.guided || {},
+                customPrompts: settings.promptSettings?.custom || {},
+                mode: "single",
+                originalError: forcedError
+            });
+        }
+    }
     const aiRes = await callAIWithTimeout(settings, [{ role: "user", content: prompt }], TASK_TIMEOUT_MS, { tabId: taskContext.tabId });
     logAI.info("ai_request_success", {
         bvid,
@@ -2743,6 +2810,12 @@ async function requestTaskResult(bvid, task, settings, taskContext = {}) {
         return summaryText;
     }
     if (task === "segments") {
+        await recordSegmentsDebugState(taskContext?.tabId || null, {
+            status: "running",
+            stage: "parsing",
+            mode: "single",
+            message: "主响应已返回，正在解析分段"
+        }, "主响应已返回，开始解析分段");
         const parsed = robustJSONParse(aiRes.text);
         let finalParsed = parsed;
         let compactRetryNormalized = null;
@@ -2814,6 +2887,13 @@ async function requestTaskResult(bvid, task, settings, taskContext = {}) {
                 originalError: normalizeError
             });
         }
+        await recordSegmentsDebugState(taskContext?.tabId || null, {
+            status: "done",
+            stage: "complete",
+            mode: "single",
+            segmentCount: normalized.length,
+            message: "分段生成完成"
+        }, `分段生成成功，共 ${normalized.length} 段`);
         logSegmentQualitySummary(bvid, normalized, cache, { task: "segments", mode: "single", subtitlePayload: getSubtitlePayloadMeta(cache, subtitleText, subtitlePayloadOptions) });
         return normalized;
     }
@@ -2987,6 +3067,44 @@ const AUTO_RETRY_SEGMENT_ERROR_CODES = new Set([
 
 function shouldAutoRetrySegmentsError(error) {
     return AUTO_RETRY_SEGMENT_ERROR_CODES.has(String(error?.code || ""));
+}
+
+function consumeDebugForceFirstSegmentsFailure(taskContext = {}) {
+    if (!taskContext || taskContext.debugForceFirstSegmentsFailure !== true) return false;
+    taskContext.debugForceFirstSegmentsFailure = false;
+    return true;
+}
+
+async function recordSegmentsDebugState(tabId, patch = {}, eventText = "", options = {}) {
+    if (!tabId) return;
+    const current = await getTabState(tabId);
+    const taskRetryState = { ...(current?.taskRetryState || {}) };
+    const previous = taskRetryState.segments && typeof taskRetryState.segments === "object"
+        ? taskRetryState.segments
+        : {};
+    const events = options.resetEvents ? [] : (Array.isArray(previous.events) ? previous.events.slice(-7) : []);
+    if (eventText) {
+        events.push({
+            at: Date.now(),
+            text: String(eventText || "")
+        });
+    }
+    taskRetryState.segments = {
+        ...previous,
+        ...patch,
+        events,
+        updatedAt: Date.now()
+    };
+    await updateTabState(tabId, { taskRetryState, updatedAt: Date.now() });
+}
+
+async function clearSegmentsDebugState(tabId) {
+    if (!tabId) return;
+    const current = await getTabState(tabId);
+    const taskRetryState = { ...(current?.taskRetryState || {}) };
+    if (!taskRetryState.segments) return;
+    delete taskRetryState.segments;
+    await updateTabState(tabId, { taskRetryState, updatedAt: Date.now() });
 }
 
 function buildPrimarySegmentsPrompt({ settings, cache, subtitleText, mode, guided, customPrompts, taskContext, promptTaskContext }) {
@@ -3209,15 +3327,6 @@ async function retrySegmentsWithAutoFallbacks({
     mode,
     originalError
 }) {
-    async function clearRetryState() {
-        if (!tabId) return;
-        const current = await getTabState(tabId);
-        const taskRetryState = { ...(current?.taskRetryState || {}) };
-        if (!taskRetryState.segments) return;
-        delete taskRetryState.segments;
-        await updateTabState(tabId, { taskRetryState, updatedAt: Date.now() });
-    }
-
     let latestError = normalizeSegmentsTaskError(originalError);
     if (!shouldAutoRetrySegmentsError(latestError)) throw latestError;
     const retrySteps = [
@@ -3245,22 +3354,26 @@ async function retrySegmentsWithAutoFallbacks({
         })
     ];
     for (let index = 0; index < retrySteps.length; index += 1) {
-        if (tabId) {
-            const current = await getTabState(tabId);
-            const taskRetryState = { ...(current?.taskRetryState || {}) };
-            taskRetryState.segments = {
-                attempt: index + 1,
-                total: retrySteps.length,
-                strategy: index === 0 ? "primary" : "compact",
-                code: String(latestError?.code || ""),
-                mode,
-                startedAt: Date.now()
-            };
-            await updateTabState(tabId, { taskRetryState, updatedAt: Date.now() });
-        }
+        const strategy = index === 0 ? "primary" : "compact";
+        await recordSegmentsDebugState(tabId, {
+            status: "retrying",
+            stage: strategy === "primary" ? "primary_retry" : "compact_retry",
+            attempt: index + 1,
+            total: retrySteps.length,
+            strategy,
+            code: String(latestError?.code || ""),
+            mode,
+            startedAt: Date.now(),
+            message: strategy === "primary" ? "原 Prompt 自动重试中" : "保守 Prompt 自动重试中"
+        }, `开始第 ${index + 1}/${retrySteps.length} 次自动重试：${strategy === "primary" ? "原 Prompt" : "保守 Prompt"}`);
         try {
             const result = await retrySteps[index]();
-            await clearRetryState();
+            await recordSegmentsDebugState(tabId, {
+                status: "recovered",
+                stage: "recovered",
+                strategy,
+                message: strategy === "primary" ? "原 Prompt 重试成功" : "保守 Prompt 重试成功"
+            }, `自动重试成功：${strategy === "primary" ? "原 Prompt" : "保守 Prompt"}`);
             return result;
         } catch (retryError) {
             latestError = normalizeSegmentsTaskError(retryError);
@@ -3275,13 +3388,18 @@ async function retrySegmentsWithAutoFallbacks({
                     retry_total: retrySteps.length
                 }
             }));
+            await recordSegmentsDebugState(tabId, {
+                status: "retry_failed",
+                stage: "retry_failed",
+                strategy,
+                code: String(latestError?.code || ""),
+                message: latestError?.message || "自动重试失败"
+            }, `自动重试失败：${strategy === "primary" ? "原 Prompt" : "保守 Prompt"} · ${String(latestError?.code || "") || "UNKNOWN"}`);
             if (!shouldAutoRetrySegmentsError(latestError) || index === retrySteps.length - 1) {
-                await clearRetryState();
                 throw latestError;
             }
         }
     }
-    await clearRetryState();
     throw latestError;
 }
 
@@ -3552,7 +3670,23 @@ async function runSummarySegmentsInQuality(tabId, bvid, force, settings, taskCon
                         compact_segments: !!segmentPromptPlan.compact
                     }
                 });
+                await recordSegmentsDebugState(tabId, {
+                    status: "running",
+                    stage: "primary_request",
+                    strategy: segmentPromptPlan.compact ? "compact" : "primary",
+                    attempt: 0,
+                    total: 2,
+                    code: "",
+                    mode: "quality",
+                    message: segmentPromptPlan.compact ? "保守 Prompt 主请求生成中" : "原 Prompt 主请求生成中"
+                }, "开始 quality 分段主请求", { resetEvents: true });
                 const aiRes = await callAIWithTimeout(settings, [{ role: "user", content: segmentsPrompt }], TASK_TIMEOUT_MS, { bypassQueue: true, tabId });
+                await recordSegmentsDebugState(tabId, {
+                    status: "running",
+                    stage: "parsing",
+                    mode: "quality",
+                    message: "主响应已返回，正在解析分段"
+                }, "quality 主响应已返回，开始解析分段");
                 const parsed = robustJSONParse(aiRes.text);
                 if (!parsed) {
                     throw attachSentryContext(
@@ -3591,6 +3725,13 @@ async function runSummarySegmentsInQuality(tabId, bvid, force, settings, taskCon
                         })
                     );
                 }
+                await recordSegmentsDebugState(tabId, {
+                    status: "done",
+                    stage: "complete",
+                    mode: "quality",
+                    segmentCount: normalized.length,
+                    message: "分段生成完成"
+                }, `quality 分段成功，共 ${normalized.length} 段`);
                 logSegmentQualitySummary(bvid, normalized, cache, {
                     task: "segments",
                     mode: segmentPromptPlan.compact ? "quality_compact_primary" : "quality",
@@ -3734,6 +3875,16 @@ async function runSummarySegmentsInEfficiency(tabId, bvid, force, settings, task
         prompt,
         promptSettings: settings.promptSettings
     });
+    await recordSegmentsDebugState(tabId, {
+        status: "running",
+        stage: "merged_request",
+        strategy: "merged",
+        attempt: 0,
+        total: 2,
+        code: "",
+        mode: "efficiency",
+        message: "省流模式联合请求生成中"
+    }, "开始 efficiency 联合请求", { resetEvents: true });
 
     const results = createSummarySegmentsResult();
     let streamBuffer = "";
@@ -3806,6 +3957,12 @@ async function runSummarySegmentsInEfficiency(tabId, bvid, force, settings, task
         let segmentsResolved = false;
         let segmentsFailureError = null;
         if (segmentsSection && segmentsSection.found) {
+            await recordSegmentsDebugState(tabId, {
+                status: "running",
+                stage: "parsing",
+                mode: "efficiency",
+                message: "联合响应已返回，正在解析分段"
+            }, "efficiency 联合响应已返回，开始解析分段");
             const parsed = robustJSONParse(segmentsSection.content);
             if (!parsed) {
                 segmentsFailureError = attachSentryContext(
@@ -4022,6 +4179,13 @@ async function runSummarySegmentsInEfficiency(tabId, bvid, force, settings, task
             }
         }
         if (!segmentsResolved) {
+            await recordSegmentsDebugState(tabId, {
+                status: "error",
+                stage: "final_error",
+                mode: "efficiency",
+                code: String(segmentsFailureError?.code || ""),
+                message: segmentsFailureError?.message || "分段最终失败"
+            }, `efficiency 分段最终失败：${String(segmentsFailureError?.code || "") || "UNKNOWN"}`);
             logAI.error("segments_parse_failed", {
                 bvid,
                 task: "segments",
@@ -4035,6 +4199,13 @@ async function runSummarySegmentsInEfficiency(tabId, bvid, force, settings, task
             });
             throw (segmentsFailureError || createAppError("SEGMENTS_MISSING_PROTOCOL", "模型漏掉了分段部分"));
         }
+        await recordSegmentsDebugState(tabId, {
+            status: "done",
+            stage: "complete",
+            mode: "efficiency",
+            segmentCount: Array.isArray(results?.segments?.data) ? results.segments.data.length : 0,
+            message: "分段生成完成"
+        }, `efficiency 分段成功，共 ${Array.isArray(results?.segments?.data) ? results.segments.data.length : 0} 段`);
         if (results.summary.ok) {
             logSummaryQualitySummary(bvid, String(results.summary.data || ""), {
                 subtitleChars: subtitleText.length,
@@ -5084,7 +5255,7 @@ async function setTaskStatus(tabId, tasks, status, lastError = "") {
         } else {
             delete taskErrors[task];
         }
-        if (status === "error" || status === "timeout" || status === "done" || status === "idle") {
+        if (status === "idle") {
             delete taskRetryState[task];
         }
     });

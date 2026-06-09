@@ -136,6 +136,20 @@
             secondaryAction: "goto-setup-guide",
             presentation: "panel"
         },
+        ASR_PLAYINFO_NOT_FRESH: {
+            title: "当前视频还没加载完成",
+            message: "视频刚切换，播放器信息还没刷新完成。请稍等 1-2 秒后再试，避免误用上一个视频的音轨。",
+            actionText: "重试",
+            action: "retry",
+            presentation: "panel"
+        },
+        ASR_AUDIO_SOURCE_BVID_MISMATCH: {
+            title: "检测到视频已切换",
+            message: "当前页面视频和本次转录目标不一致。已停止继续转录，避免把字幕写到上一个视频上。",
+            actionText: "重试",
+            action: "retry",
+            presentation: "panel"
+        },
         NETWORK_ERROR: {
             title: "网络连接失败",
             message: "请检查网络连接，或稍后重试。",
