@@ -44,6 +44,8 @@ const files = [
   "html2canvas.min.js",
   "markdownRenderer.js",
   "storeConfig.js",
+  "offscreen.html",
+  "offscreen.js",
   "permission-request.html",
   "permission-request.js",
   "rules.json",
@@ -54,7 +56,9 @@ const directories = [
   "_locales",
   "assets",
   "content",
-  "utils"
+  "utils",
+  "node_modules/@ffmpeg/ffmpeg/dist/esm",
+  "node_modules/@ffmpeg/core/dist/esm"
 ];
 
 function copyRequiredFile(relativePath, releaseDir) {
@@ -71,6 +75,7 @@ function copyRequiredDirectory(relativePath, releaseDir) {
   if (!existsSync(source)) {
     throw new Error(`缺少上架必需目录：${relativePath}`);
   }
+  mkdirSync(dirname(destination), { recursive: true });
   execFileSync("powershell.exe", [
     "-NoProfile",
     "-ExecutionPolicy",

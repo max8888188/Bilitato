@@ -339,6 +339,7 @@ const appState = {
     chatPort: null,
     chatActiveMessageId: "",
     debugLogPollTimer: null,
+    asrRateLimitRetryAfterSec: 0,
     asrUiTraceLogs: [],
     chatAutoScrollPausedUntil: 0,
     pendingSubtitle: null,
@@ -729,7 +730,7 @@ function toErrorInput(error, fallbackMessage = "请求失败") {
         message: String(error?.message || error?.error || fallbackMessage),
         code: String(error?.code || ""),
         status: Number(error?.status || 0) || undefined,
-        retryAfterSec: Number(error?.retryAfterSec || 0) || undefined
+        retryAfterSec: Number(error?.retryAfterSec || appState.asrRateLimitRetryAfterSec || 0) || undefined
     };
 }
 
@@ -1940,7 +1941,7 @@ function bindPanelDelegatedEvents() {
         if (action === "debug-show-release-notice") {
             globalThis.BilitatoReleaseNotice?.renderReleaseNotice?.({
                 root: panelShadowRoot,
-                version: globalThis.chrome?.runtime?.getManifest?.()?.version || "1.3.1"
+                version: globalThis.chrome?.runtime?.getManifest?.()?.version || "1.4.0"
             });
             return;
         }
@@ -1998,10 +1999,14 @@ function bindPanelDelegatedEvents() {
     panelRoot.addEventListener("mouseover", (event) => {
         const badge = event.target.closest(".provider-free-badge");
         if (badge) showProviderQuotaTooltip(badge);
+        const infoIcon = event.target.closest(".custom-option-info");
+        if (infoIcon) showProviderQuotaTooltip(infoIcon);
     });
     panelRoot.addEventListener("mouseout", (event) => {
         const badge = event.target.closest(".provider-free-badge");
         if (badge && !badge.contains(event.relatedTarget)) hideProviderQuotaTooltip();
+        const infoIcon = event.target.closest(".custom-option-info");
+        if (infoIcon && !infoIcon.contains(event.relatedTarget)) hideProviderQuotaTooltip();
     });
 }
 
@@ -3731,7 +3736,7 @@ function renderSettings(panel) {
                     ${arrowIcon}
                 </div>
                 <div class="custom-select-options">
-                    ${items.map((item) => `<div class="custom-option ${String(item.value) === String(selected.value) ? "selected" : ""}" data-value="${escapeHtmlAttr(item.value)}">${escapeHtml(item.label)}</div>`).join("")}
+                    ${items.map((item) => `<div class="custom-option ${String(item.value) === String(selected.value) ? "selected" : ""}" data-value="${escapeHtmlAttr(item.value)}" data-label="${escapeHtmlAttr(item.label)}"><span class="custom-option-main"><span>${escapeHtml(item.label)}</span>${item.tooltip ? `<span class="settings-info-icon custom-option-info" data-no-select="true" data-tooltip="${escapeHtmlAttr(item.tooltip)}">i</span>` : ""}</span></div>`).join("")}
                 </div>
             </div>
         `;
@@ -3778,7 +3783,8 @@ function renderSettings(panel) {
     const asrProvider = asrProviders[asrProviderKey] || asrProviders.groq;
     const asrOptionsHtml = Object.entries(asrProviders).map(([key, item]) => {
         const isSelected = key === asrProviderKey;
-        return `<div class="custom-option ${isSelected ? "selected" : ""}" data-value="${escapeHtmlAttr(key)}" data-label="${escapeHtmlAttr(item.name)}"><span>${escapeHtml(item.name)}</span><span class="custom-option-note">${escapeHtml(item.note)}</span></div>`;
+        const tooltip = key === "groq" ? GROQ_ASR_LIMIT_TOOLTIP : "";
+        return `<div class="custom-option ${isSelected ? "selected" : ""}" data-value="${escapeHtmlAttr(key)}" data-label="${escapeHtmlAttr(item.name)}"><span class="custom-option-main"><span>${escapeHtml(item.name)}</span>${tooltip ? `<span class="settings-info-icon custom-option-info" data-no-select="true" data-tooltip="${escapeHtmlAttr(tooltip)}">i</span>` : ""}</span><span class="custom-option-note">${escapeHtml(item.note)}</span></div>`;
     }).join("");
     const groqModel = String(settings.groqModel || "whisper-large-v3-turbo");
     const siliconFlowAsrModel = String(settings.siliconFlowAsrModel || "FunAudioLLM/SenseVoiceSmall");
@@ -3817,7 +3823,7 @@ function renderSettings(panel) {
                 <label>Model</label>
                 <div id="settings-provider-model-wrap" class="${providerModelWrapVisible}">
                     ${renderCustomSelect("settings-provider-model", [
-                        ...providerModelOptions.map((model) => ({ value: model, label: model })),
+                        ...providerModelOptions.map((model) => ({ value: model, label: model, tooltip: providerKey === "modelscope" ? (MODELSCOPE_MODEL_LIMIT_TOOLTIPS[model] || "") : "" })),
                         { value: "custom", label: "自定义" }
                     ], providerModelSelectValue)}
                     <input id="settings-provider-custom-model" class="${providerCustomModelVisible}" type="text" value="${escapeHtml(currentModel)}" placeholder="请输入模型名">
@@ -4207,7 +4213,7 @@ function renderSettings(panel) {
 }
 
 function renderErrorDemoControls() {
-    const currentVersion = globalThis.chrome?.runtime?.getManifest?.()?.version || "1.3.1";
+    const currentVersion = globalThis.chrome?.runtime?.getManifest?.()?.version || "1.4.0";
     const panelErrors = [
         ["HTTP_401", "401 Key 无效", "summary"],
         ["ALIYUN_REALNAME_REQUIRED", "阿里云未实名", "summary"],
@@ -4299,6 +4305,7 @@ function renderSegmentPromptDebugControls() {
 
 function renderTaskRetryDebugPanel() {
     const retryState = appState.tabState?.taskRetryState?.segments || null;
+    const asrChunkingState = appState.tabState?.taskRetryState?.asrChunking || null;
     const taskStatus = String(appState.tabState?.taskStatus?.segments || "idle");
     const taskError = appState.tabState?.taskErrors?.segments || null;
     const events = Array.isArray(retryState?.events) ? retryState.events : [];
@@ -4331,6 +4338,36 @@ function renderTaskRetryDebugPanel() {
             return `<div style="margin-bottom:6px;"><strong>${escapeHtml(time)}</strong> · ${escapeHtml(String(item?.text || ""))}</div>`;
         }).join("")}</div>`
         : `<div class="empty-text" style="margin-top:8px;">当前还没有分段阶段事件。</div>`;
+    const boundaries = Array.isArray(asrChunkingState?.boundaries) ? asrChunkingState.boundaries : [];
+    const renderBoundaryRows = (rows = []) => {
+        if (!rows.length) return `<div class="empty-text">无</div>`;
+        return rows.map((row) => {
+            const hasTimeline = Number.isFinite(Number(row?.start)) && Number.isFinite(Number(row?.end));
+            const label = hasTimeline
+                ? `${formatTime(Number(row?.start || 0))}-${formatTime(Number(row?.end || 0))}`
+                : "无时间轴";
+            return `<div style="margin-bottom:6px;"><strong>${escapeHtml(label)}</strong> · ${escapeHtml(String(row?.text || ""))}</div>`;
+        }).join("");
+    };
+    const chunkBoundaryHtml = boundaries.length
+        ? `<div class="debug-state-preview" style="margin-top:8px;">${boundaries.map((item) => {
+            const chunkLabel = `Chunk ${Number(item?.chunkIndex || 0)}/${Number(item?.chunkCount || 0)}`;
+            const rangeLabel = `${formatTime(Number(item?.startSec || 0))}-${formatTime(Number(item?.endSec || 0))}`;
+            return `
+                <div style="margin-bottom:14px; padding-bottom:10px; border-bottom:1px solid rgba(0,0,0,.08);">
+                    <div><strong>${escapeHtml(chunkLabel)}</strong> · ${escapeHtml(rangeLabel)}</div>
+                    <div style="margin-top:6px;"><strong>本片开头字幕</strong></div>
+                    <div>${renderBoundaryRows(item?.sourceHead || [])}</div>
+                    <div style="margin-top:6px;"><strong>本片结尾字幕</strong></div>
+                    <div>${renderBoundaryRows(item?.sourceTail || [])}</div>
+                    <div style="margin-top:6px;"><strong>合并前上一片尾部</strong></div>
+                    <div>${renderBoundaryRows(item?.mergedTailBefore || [])}</div>
+                    <div style="margin-top:6px;"><strong>合并后尾部结果</strong></div>
+                    <div>${renderBoundaryRows(item?.mergedTailAfter || [])}</div>
+                </div>
+            `;
+        }).join("")}</div>`
+        : `<div class="empty-text" style="margin-top:8px;">当前还没有切片边界诊断数据。</div>`;
     return `
         <div class="settings-group-title">分段自动重试状态</div>
         <div class="error-demo-section">
@@ -4349,6 +4386,8 @@ function renderTaskRetryDebugPanel() {
             </div>
             <div class="error-demo-label">最近阶段事件</div>
             ${eventListHtml}
+            <div class="error-demo-label">切片边界诊断</div>
+            ${chunkBoundaryHtml}
         </div>
     `;
 }
@@ -5299,6 +5338,15 @@ function updateSettingsProviderHint(panel) {
     }
 }
 
+const GROQ_ASR_LIMIT_TOOLTIP = "当前常见 Groq 转录限额：RPM 20；ASH 7.2K（每小时约 2 小时音频）。具体以 Groq 控制台 Limits 页面为准。";
+const MODELSCOPE_MODEL_LIMIT_TOOLTIPS = {
+    "moonshotai/Kimi-K2.5": "Kimi-K2.5：50次/天",
+    "MiniMax/MiniMax-M2.5": "MiniMax-M2.5：100次/天",
+    "deepseek-ai/DeepSeek-V3.2": "DeepSeek-R1/V3：20次/天",
+    "Qwen/Qwen3.5-27B": "Qwen3/3.5系列：500次/天",
+    "ZhipuAI/GLM-5.1": "GLM-4.5/4.7/5系列：50次/天"
+};
+
 function updateSettingsAsrProviderHint(panel) {
     const asrProviders = {
         groq: {
@@ -5443,6 +5491,10 @@ function bindSettingsCustomSelects(panel) {
 
         selectOptions.querySelectorAll(".custom-option").forEach((option) => {
             option.addEventListener("click", (event) => {
+                if (event.target?.closest?.('[data-no-select="true"]')) {
+                    event.stopPropagation();
+                    return;
+                }
                 event.stopPropagation();
                 const value = String(option.dataset.value || "");
                 nativeSelect.value = value;
@@ -7338,6 +7390,9 @@ function onBackgroundMessage(message) {
         if (text) {
             patchTranscriptionState({ statusText: text });
         }
+        if (String(message?.code || "") === "ASR_RATE_LIMIT" || /限流|rate limit/i.test(text)) {
+            appState.asrRateLimitRetryAfterSec = Math.max(0, Number(message?.retryAfterSec || appState.asrRateLimitRetryAfterSec || 0));
+        }
         if (isError) {
             clearAsrSession();
             if (appState.tabState && typeof appState.tabState === "object") {
@@ -7388,6 +7443,7 @@ function onBackgroundMessage(message) {
             appState.transcribeCountdownTimer = null;
         }
         if (retryAfterSec > 0) {
+            appState.asrRateLimitRetryAfterSec = retryAfterSec;
             if (appState.transcribeCountdownTimer) {
                 clearInterval(appState.transcribeCountdownTimer);
                 appState.transcribeCountdownTimer = null;
@@ -7395,16 +7451,49 @@ function onBackgroundMessage(message) {
             let remain = retryAfterSec;
             appState.transcribeCountdownTimer = setInterval(() => {
                 remain -= 1;
+                appState.asrRateLimitRetryAfterSec = Math.max(0, remain);
+                if (appState.panelErrors?.CC?.code === "ASR_RATE_LIMIT") {
+                    appState.panelErrors = {
+                        ...(appState.panelErrors || {}),
+                        CC: mapErrorToView ? mapErrorToView({
+                            code: "ASR_RATE_LIMIT",
+                            message: "Groq 转录额度或频率已超限，请等待提示时间后再试，或切换到硅基流动继续生成。",
+                            retryAfterSec: Math.max(0, remain)
+                        }, "请求失败", {
+                            provider: appState.settings?.provider || "",
+                            surface: "panel"
+                        }) : appState.panelErrors?.CC
+                    };
+                    renderContent();
+                }
                 if (remain <= 0) {
                     clearInterval(appState.transcribeCountdownTimer);
                     appState.transcribeCountdownTimer = null;
+                    appState.asrRateLimitRetryAfterSec = 0;
+                    if (appState.panelErrors?.CC?.code === "ASR_RATE_LIMIT") {
+                        appState.panelErrors = {
+                            ...(appState.panelErrors || {}),
+                            CC: mapErrorToView ? mapErrorToView({
+                                code: "ASR_RATE_LIMIT",
+                                message: "Groq 转录额度或频率已超限，请等待提示时间后再试，或切换到硅基流动继续生成。",
+                                retryAfterSec: 0
+                            }, "请求失败", {
+                                provider: appState.settings?.provider || "",
+                                surface: "panel"
+                            }) : appState.panelErrors?.CC
+                        };
+                        renderContent();
+                    }
                     showToast("可以重试转录了");
                     return;
                 }
                 showToast(`请等待 ${remain} 秒后重试`);
             }, 1000);
+        } else if (String(message?.stage || "") === "retry_countdown") {
+            appState.asrRateLimitRetryAfterSec = 0;
         }
         if (message?.stage === "done") {
+            appState.asrRateLimitRetryAfterSec = 0;
             const taskBvid = normalizeBvidCase(appState.asrSession?.bvid || getTranscriptionBvid() || "");
             const currentBvid = normalizeBvidCase(appState.injectBvid || getStableCurrentBvid() || "");
             

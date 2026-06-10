@@ -2035,9 +2035,20 @@ input[type="range"]:active::-webkit-slider-thumb {
     border-radius: 8px;
     cursor: pointer;
     transition: background 0.15s ease, color 0.15s ease;
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 2px;
 }
 
 .provider-option-main {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    min-width: 0;
+}
+
+.custom-option-main {
     display: inline-flex;
     align-items: center;
     gap: 6px;
@@ -2092,6 +2103,15 @@ input[type="range"]:active::-webkit-slider-thumb {
 
 .custom-option.selected .custom-option-note {
     color: #d85b86;
+}
+
+.custom-option-info {
+    flex: 0 0 auto;
+}
+
+.settings-info-icon.custom-option-info:hover::after,
+.settings-info-icon.custom-option-info:hover::before {
+    display: none;
 }
 
 .custom-option:hover {
@@ -3461,6 +3481,8 @@ input[type="range"]:active::-webkit-slider-thumb {
     display: flex;
     flex-direction: column;
     gap: 3px;
+    padding-left: 10px;
+    padding-right: 10px;
     padding-top: 8px;
     border-top: 1px solid rgba(0, 0, 0, 0.05);
 }

@@ -270,12 +270,36 @@
         },
         ASR_RATE_LIMIT: {
             title: "转录请求太频繁",
-            message: "Groq 转录额度或频率已超限，请等待提示时间后再试，或切换到硅基流动继续生成。",
-            presentation: "toast"
+            message: "Groq 转录额度或频率已超限。当前常见限制为 RPM 20、ASH 7.2K（每小时约 2 小时音频），具体以 Groq 控制台 Limits 页面为准。请等待提示时间后再试，或切换到硅基流动继续生成。",
+            actionText: "重试转录",
+            action: "retry",
+            secondaryActionText: "去设置",
+            secondaryAction: "goto-setup-guide",
+            presentation: "panel"
         },
         ASR_FILE_TOO_LARGE: {
             title: "音频过大",
             message: "当前视频音频超过转录服务限制，暂时无法转录。",
+            presentation: "panel"
+        },
+        ASR_CHUNKING_UNSUPPORTED: {
+            title: "自动切片仍超限",
+            message: "当前视频音轨即使自动切片后，单段仍超过转录服务限制，暂时无法继续转录。",
+            presentation: "panel"
+        },
+        ASR_CHUNK_DURATION_UNKNOWN: {
+            title: "无法识别音轨时长",
+            message: "当前音轨暂时无法识别时长，自动切片无法继续，请稍后重试。",
+            presentation: "panel"
+        },
+        ASR_CHUNKING_FAILED: {
+            title: "音轨切片失败",
+            message: "自动切片过程中出错，请稍后重试。",
+            presentation: "panel"
+        },
+        ASR_CHUNK_FETCH_FAILED: {
+            title: "切片前下载失败",
+            message: "切片前重新拉取音轨失败，请稍后重试。",
             presentation: "panel"
         },
         SUBTITLE_MISSING: {
@@ -385,6 +409,12 @@
             view.secondaryActionText = "重试";
             view.secondaryAction = "retry";
         }
+        const retryAfterSec = Math.max(0, Number(errorInput?.retryAfterSec || 0));
+        if (code === "ASR_RATE_LIMIT" && retryAfterSec > 0) {
+            view.extraMessage = `预计还需等待 ${retryAfterSec} 秒后才能再次发起转录。`;
+            view.actionText = `请等待 ${retryAfterSec} 秒`;
+            view.actionDisabled = true;
+        }
         if (view.presentation !== "toast" && view.action !== "retry" && view.secondaryAction !== "retry") {
             view.secondaryActionText = "重试";
             view.secondaryAction = "retry";
@@ -397,7 +427,7 @@
         const resolvedRetryAction = retryAction || "refresh-page";
         const action = view.action === "retry" ? resolvedRetryAction : view.action;
         const primaryButton = action && view.actionText
-            ? `<button class="action-btn" data-action="${safe(action)}">${safe(view.actionText)}</button>`
+            ? `<button class="action-btn" data-action="${safe(action)}" ${view.actionDisabled ? "disabled" : ""}>${safe(view.actionText)}</button>`
             : "";
         const secondaryAction = view.secondaryAction === "retry" ? resolvedRetryAction : view.secondaryAction;
         const secondaryButton = secondaryAction && view.secondaryActionText

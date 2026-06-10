@@ -8,6 +8,10 @@ import {
     parseRetryAfterSeconds
 } from "./utils/asrTranscription.js";
 import {
+    DEFAULT_ASR_CHUNK_OVERLAP_SECONDS,
+    mergeTimestampedChunkRows
+} from "./utils/asrChunking.js";
+import {
     DEFAULT_PROMPT_SETTINGS,
     SEGMENTS_AD_TEST_PROMPT,
     buildCompactSegmentsPrompt,
@@ -34,6 +38,9 @@ const TIMEOUT_ERROR_CODES = new Set([
     "NETWORK_REQUEST_TIMEOUT"
 ]);
 const STREAM_INITIAL_RETRY_DELAY_MS = 700;
+const OFFSCREEN_DOCUMENT_PATH = "offscreen.html";
+let offscreenDocumentPromise = null;
+const MAX_ASR_BOUNDARY_DIAGNOSTICS = 8;
 
 
 
@@ -216,6 +223,15 @@ function removeEmptyValues(value = {}) {
     return Object.fromEntries(
         Object.entries(value || {}).filter(([, item]) => item !== undefined && item !== null && item !== "")
     );
+}
+
+function formatPlaybackTime(totalSeconds = 0) {
+    const safe = Math.max(0, Number(totalSeconds || 0));
+    const hours = Math.floor(safe / 3600);
+    const minutes = Math.floor((safe % 3600) / 60);
+    const seconds = Math.floor(safe % 60);
+    const hh = hours > 0 ? `${String(hours).padStart(2, "0")}:` : "";
+    return `${hh}${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`;
 }
 
 function shouldCaptureRuntimeMessageError(msg, error) {
@@ -614,6 +630,12 @@ chrome.storage.onChanged.addListener((changes, areaName) => {
 });
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+    if (msg?.action === "OFFSCREEN_CHUNK_AUDIO_PROGRESS") {
+        handleOffscreenChunkProgress(msg?.payload || {}).catch(() => {});
+        sendResponse({ ok: true });
+        return false;
+    }
+    if (/^OFFSCREEN_CHUNK_AUDIO/.test(String(msg?.action || ""))) return false;
     handleMessage(msg, sender)
         .then((result) => sendResponse({ ok: true, ...result }))
         .catch((error) => {
@@ -1612,7 +1634,15 @@ class ContentProvider {
             await updateTabState(tabId, { activeBvid: bvid, transcriptionProgress: 20, updatedAt: Date.now() });
             await notifyTranscribeStatus(tabId, { stage: "download", level: "info", text: "正在下载音轨...", progress: 20, bvid });
             const audioFetchStartedAt = Date.now();
-            const audioBlob = await this.fetchResourceToBlob(media.url, tabId, bvid, false, asrMaxAudioBytes, operationController.signal);
+            const shouldAllowOversizeDownload = asrProvider === "groq" || asrProvider === "siliconflow";
+            const audioBlob = await this.fetchResourceToBlob(
+                media.url,
+                tabId,
+                bvid,
+                shouldAllowOversizeDownload,
+                asrMaxAudioBytes,
+                operationController.signal
+            );
             await updateTabState(tabId, { activeBvid: bvid, transcriptionProgress: 56, updatedAt: Date.now() });
             await notifyTranscribeStatus(tabId, { stage: "prepare_upload", level: "info", text: `下载完成，正在准备上传到 ${asrDisplayName}...`, progress: 56, bvid });
             const audioFetchMs = Date.now() - audioFetchStartedAt;
@@ -1636,54 +1666,83 @@ class ContentProvider {
                     audio_host: getUrlMeta(media.url).host
                 }
             });
-            if (audioBlob.size >= asrMaxAudioBytes) {
-                const limitMb = Math.floor(asrMaxAudioBytes / 1024 / 1024);
-                throw createAppError("ASR_FILE_TOO_LARGE", `该视频音轨文件大小超出限制（>=${limitMb}MB），目前暂不支持`);
-            }
-            const audioFile = new File([audioBlob], "audio.m4a", { type: audioBlob.type || "audio/mp4" });
-            await updateTabState(tabId, { activeBvid: bvid, transcriptionProgress: 55, updatedAt: Date.now() });
-            
-            let fakeProgress = 55;
-            await notifyTranscribeStatus(tabId, { stage: "upload", level: "info", text: `正在上传音轨到 ${asrDisplayName}...`, progress: fakeProgress, bvid });
-            
-            let uploadStageActive = true;
-            const progressTimer = setInterval(() => {
-                if (!uploadStageActive || operationController.signal.aborted) return;
-                const inc = 2 + Math.floor(Math.random() * 2); // 2-3%
-                fakeProgress = Math.min(88, fakeProgress + inc);
-                updateTabState(tabId, { activeBvid: bvid, transcriptionProgress: fakeProgress, updatedAt: Date.now() }).catch(() => {});
-                notifyTranscribeStatus(tabId, { 
-                    stage: "upload", 
-                    level: "info", 
-                    text: `正在上传音轨到 ${asrDisplayName}...`, 
-                    progress: fakeProgress,
-                    bvid
-                }).catch(() => {});
-            }, 2000);
-
             let transcription;
             const asrRequestStartedAt = Date.now();
-            try {
-                transcription = asrProvider === "siliconflow"
-                    ? await this.requestSiliconFlowTranscription(audioFile, asrApiKey, asrModel, tabId, bvid, operationController.signal)
-                    : await this.requestGroqTranscription(audioFile, asrApiKey, asrModel, tabId, bvid, title || media.title || "", operationController.signal);
-                logASR.info("asr_request_success", {
-                    bvid,
-                    task: "asr",
-                    provider: asrProvider,
-                    model: asrModel,
-                    duration_ms: Date.now() - asrRequestStartedAt,
-                    detail: {
-                        run_id: asrRunId,
-                        audio_bytes: audioBlob.size || 0,
-                        audio_sha256: audioDigest.audio_sha256,
-                        quota: buildGroqQuotaLine(transcription.quota)
-                    }
+            if (audioBlob.size >= asrMaxAudioBytes) {
+                await updateTabState(tabId, { activeBvid: bvid, transcriptionProgress: 58, updatedAt: Date.now() });
+                await notifyTranscribeStatus(tabId, {
+                    stage: "chunk_prepare",
+                    level: "info",
+                    text: "音轨较大，正在切片后分段转录...",
+                    progress: 58,
+                    bvid
                 });
-            } finally {
-                uploadStageActive = false;
-                clearInterval(progressTimer);
+                transcription = asrProvider === "siliconflow"
+                    ? await this.requestSiliconFlowChunkedTranscription(audioBlob, {
+                        tabId,
+                        bvid,
+                        asrApiKey,
+                        asrModel,
+                        maxAudioBytes: asrMaxAudioBytes,
+                        audioUrl: media.url,
+                        signal: operationController.signal
+                    })
+                    : await this.requestGroqChunkedTranscription(audioBlob, {
+                        tabId,
+                        bvid,
+                        videoTitle: title || media.title || "",
+                        groqApiKey: asrApiKey,
+                        groqModel: asrModel,
+                        maxAudioBytes: asrMaxAudioBytes,
+                        audioUrl: media.url,
+                        signal: operationController.signal
+                    });
+            } else {
+                const audioFile = new File([audioBlob], "audio.m4a", { type: audioBlob.type || "audio/mp4" });
+                await updateTabState(tabId, { activeBvid: bvid, transcriptionProgress: 55, updatedAt: Date.now() });
+
+                let fakeProgress = 55;
+                await notifyTranscribeStatus(tabId, { stage: "upload", level: "info", text: `正在上传音轨到 ${asrDisplayName}...`, progress: fakeProgress, bvid });
+
+                let uploadStageActive = true;
+                const progressTimer = setInterval(() => {
+                    if (!uploadStageActive || operationController.signal.aborted) return;
+                    const inc = 2 + Math.floor(Math.random() * 2);
+                    fakeProgress = Math.min(88, fakeProgress + inc);
+                    updateTabState(tabId, { activeBvid: bvid, transcriptionProgress: fakeProgress, updatedAt: Date.now() }).catch(() => {});
+                    notifyTranscribeStatus(tabId, {
+                        stage: "upload",
+                        level: "info",
+                        text: `正在上传音轨到 ${asrDisplayName}...`,
+                        progress: fakeProgress,
+                        bvid
+                    }).catch(() => {});
+                }, 2000);
+
+                try {
+                    transcription = asrProvider === "siliconflow"
+                        ? await this.requestSiliconFlowTranscription(audioFile, asrApiKey, asrModel, tabId, bvid, operationController.signal)
+                        : await this.requestGroqTranscription(audioFile, asrApiKey, asrModel, tabId, bvid, title || media.title || "", operationController.signal);
+                } finally {
+                    uploadStageActive = false;
+                    clearInterval(progressTimer);
+                }
             }
+            logASR.info("asr_request_success", {
+                bvid,
+                task: "asr",
+                provider: asrProvider,
+                model: asrModel,
+                duration_ms: Date.now() - asrRequestStartedAt,
+                detail: {
+                    run_id: asrRunId,
+                    audio_bytes: audioBlob.size || 0,
+                    audio_sha256: audioDigest.audio_sha256,
+                    quota: buildGroqQuotaLine(transcription.quota),
+                    chunked: !!transcription?.meta?.chunked,
+                    chunk_count: Number(transcription?.meta?.chunkCount || 0) || undefined
+                }
+            });
 
             await notifyTranscribeStatus(tabId, { stage: "parse", level: "info", text: `${asrDisplayName} 正在解析中文字幕...`, progress: 90, bvid });
             await updateTabState(tabId, { activeBvid: bvid, transcriptionProgress: 90, updatedAt: Date.now() });
@@ -2075,6 +2134,166 @@ class ContentProvider {
         });
         const data = await response.json().catch(() => null);
         return { data, quota };
+    }
+
+    static async requestGroqChunkedTranscription(audioBlob, options = {}) {
+        const tabId = Number(options.tabId || 0);
+        const bvid = normalizeBvid(options.bvid || "");
+        const videoTitle = String(options.videoTitle || "").trim();
+        const groqApiKey = String(options.groqApiKey || "").trim();
+        const groqModel = String(options.groqModel || "").trim() || "whisper-large-v3-turbo";
+        const maxAudioBytes = Number(options.maxAudioBytes || GROQ_MAX_AUDIO_BYTES);
+        const signal = options.signal || null;
+        if (signal?.aborted) throw createUserAbortedError();
+        let chunkSessionId = "";
+        try {
+            const chunked = await requestOffscreenAudioChunkingPrepare({
+                audioBytes: null,
+                audioUrl: String(options.audioUrl || "").trim(),
+                mimeType: audioBlob.type || "audio/mp4",
+                maxAudioBytes
+            });
+            chunkSessionId = String(chunked?.sessionId || "").trim();
+            logASR.info("asr_chunk_plan_created", {
+                bvid,
+                task: "asr",
+                provider: "groq",
+                model: groqModel,
+                detail: {
+                    total_audio_bytes: audioBlob.size,
+                    duration_sec: Number(chunked?.durationSec || 0),
+                    chunk_seconds: Number(chunked?.chunkSeconds || 0),
+                    overlap_seconds: Number(chunked?.overlapSeconds || DEFAULT_ASR_CHUNK_OVERLAP_SECONDS),
+                    chunk_count: Number(chunked?.chunkCount || 0)
+                }
+            });
+            const chunks = Array.isArray(chunked?.chunks) ? chunked.chunks : [];
+            if (chunks.some((chunk) => chunk.bytes >= maxAudioBytes)) {
+                throw createAppError("ASR_CHUNKING_UNSUPPORTED", "自动切片后单段音轨仍超出限制，请稍后再试");
+            }
+            await updateTabState(tabId, { activeBvid: bvid, transcriptionProgress: 68, updatedAt: Date.now() });
+            await notifyTranscribeStatus(tabId, {
+                stage: "upload",
+                level: "info",
+                text: `正在转录 ${chunks.length} 段音轨...`,
+                progress: 68,
+                bvid
+            });
+            const chunkResult = await requestOffscreenChunkTranscriptionAll({
+                sessionId: chunkSessionId,
+                provider: "groq",
+                tabId,
+                bvid,
+                apiKey: groqApiKey,
+                model: groqModel,
+                videoTitle
+            });
+            const mergedRows = Array.isArray(chunkResult?.rows) ? chunkResult.rows : [];
+            const quota = chunkResult?.quota || null;
+            await recordAsrChunkingDebugState(tabId, chunkResult?.diagnostics || null);
+            return {
+                data: {
+                    text: mergedRows.map((row) => row.text).join(" ").trim(),
+                    segments: mergedRows.map((row) => ({
+                        start: row.start,
+                        end: row.end,
+                        text: row.text
+                    }))
+                },
+                quota,
+                meta: {
+                    chunked: true,
+                    chunkCount: chunks.length,
+                    durationSec: Number(chunked?.durationSec || 0),
+                    chunkSeconds: Number(chunked?.chunkSeconds || 0)
+                }
+            };
+        } catch (error) {
+            if (typeof error === "string" && /ffmpeg/i.test(error)) {
+                throw createAppError("ASR_CHUNKING_FAILED", "音轨切片失败，请稍后重试");
+            }
+            throw error;
+        } finally {
+            if (chunkSessionId) {
+                await releaseOffscreenAudioChunkSession(chunkSessionId).catch(() => {});
+            }
+        }
+    }
+
+    static async requestSiliconFlowChunkedTranscription(audioBlob, options = {}) {
+        const tabId = Number(options.tabId || 0);
+        const bvid = normalizeBvid(options.bvid || "");
+        const asrApiKey = String(options.asrApiKey || "").trim();
+        const asrModel = String(options.asrModel || "").trim() || "FunAudioLLM/SenseVoiceSmall";
+        const maxAudioBytes = Number(options.maxAudioBytes || SILICONFLOW_MAX_AUDIO_BYTES);
+        const signal = options.signal || null;
+        if (signal?.aborted) throw createUserAbortedError();
+        let chunkSessionId = "";
+        try {
+            const chunked = await requestOffscreenAudioChunkingPrepare({
+                audioBytes: null,
+                audioUrl: String(options.audioUrl || "").trim(),
+                mimeType: audioBlob.type || "audio/mp4",
+                maxAudioBytes
+            });
+            chunkSessionId = String(chunked?.sessionId || "").trim();
+            logASR.info("asr_chunk_plan_created", {
+                bvid,
+                task: "asr",
+                provider: "siliconflow",
+                model: asrModel,
+                detail: {
+                    total_audio_bytes: audioBlob.size,
+                    duration_sec: Number(chunked?.durationSec || 0),
+                    chunk_seconds: Number(chunked?.chunkSeconds || 0),
+                    overlap_seconds: Number(chunked?.overlapSeconds || DEFAULT_ASR_CHUNK_OVERLAP_SECONDS),
+                    chunk_count: Number(chunked?.chunkCount || 0)
+                }
+            });
+            const chunks = Array.isArray(chunked?.chunks) ? chunked.chunks : [];
+            if (chunks.some((chunk) => chunk.bytes >= maxAudioBytes)) {
+                throw createAppError("ASR_CHUNKING_UNSUPPORTED", "自动切片后单段音轨仍超出限制，请稍后再试");
+            }
+            await updateTabState(tabId, { activeBvid: bvid, transcriptionProgress: 68, updatedAt: Date.now() });
+            await notifyTranscribeStatus(tabId, {
+                stage: "upload",
+                level: "info",
+                text: `正在转录 ${chunks.length} 段音轨...`,
+                progress: 68,
+                bvid
+            });
+            const chunkResult = await requestOffscreenChunkTranscriptionAll({
+                sessionId: chunkSessionId,
+                provider: "siliconflow",
+                tabId,
+                bvid,
+                apiKey: asrApiKey,
+                model: asrModel
+            });
+            const mergedRows = Array.isArray(chunkResult?.rows) ? chunkResult.rows : [];
+            await recordAsrChunkingDebugState(tabId, chunkResult?.diagnostics || null);
+            return {
+                data: {
+                    text: mergedRows.map((row) => row.text).join(" ").trim()
+                },
+                quota: null,
+                meta: {
+                    chunked: true,
+                    chunkCount: chunks.length,
+                    durationSec: Number(chunked?.durationSec || 0),
+                    chunkSeconds: Number(chunked?.chunkSeconds || 0)
+                }
+            };
+        } catch (error) {
+            if (typeof error === "string" && /ffmpeg/i.test(error)) {
+                throw createAppError("ASR_CHUNKING_FAILED", "音轨切片失败，请稍后重试");
+            }
+            throw error;
+        } finally {
+            if (chunkSessionId) {
+                await releaseOffscreenAudioChunkSession(chunkSessionId).catch(() => {});
+            }
+        }
     }
 
     static async requestSiliconFlowTranscription(audioFile, apiKey, model, tabId, bvid = "", externalSignal = null) {
@@ -3069,6 +3288,115 @@ function shouldAutoRetrySegmentsError(error) {
     return AUTO_RETRY_SEGMENT_ERROR_CODES.has(String(error?.code || ""));
 }
 
+async function ensureOffscreenDocument() {
+    const targetUrl = chrome.runtime.getURL(OFFSCREEN_DOCUMENT_PATH);
+    if (offscreenDocumentPromise) return offscreenDocumentPromise;
+    offscreenDocumentPromise = (async () => {
+        try {
+            if (chrome.runtime.getContexts) {
+                const contexts = await chrome.runtime.getContexts({
+                    contextTypes: ["OFFSCREEN_DOCUMENT"],
+                    documentUrls: [targetUrl]
+                });
+                if (Array.isArray(contexts) && contexts.length) return;
+            }
+            await chrome.offscreen.createDocument({
+                url: OFFSCREEN_DOCUMENT_PATH,
+                reasons: ["WORKERS"],
+                justification: "Use ffmpeg workers to split oversized audio before Groq transcription"
+            });
+        } catch (error) {
+            const message = String(error?.message || error || "");
+            if (!/Only a single offscreen document may be created|already exists/i.test(message)) {
+                offscreenDocumentPromise = null;
+                throw error;
+            }
+        }
+    })();
+    return offscreenDocumentPromise;
+}
+
+async function requestOffscreenAudioChunkingPrepare(payload = {}) {
+    await ensureOffscreenDocument();
+    const response = await chrome.runtime.sendMessage({
+        action: "OFFSCREEN_CHUNK_AUDIO_PREPARE",
+        payload
+    });
+    if (!response?.ok) {
+        throw createAppError(
+            response?.code || "ASR_CHUNKING_FAILED",
+            response?.error || "音轨切片失败，请稍后重试"
+        );
+    }
+    return response.result || {};
+}
+
+async function requestOffscreenGroqChunkTranscription(payload = {}) {
+    await ensureOffscreenDocument();
+    const response = await chrome.runtime.sendMessage({
+        action: "OFFSCREEN_CHUNK_AUDIO_TRANSCRIBE_ALL",
+        payload
+    });
+    if (!response?.ok) {
+        throw createAppError(
+            response?.code || "ASR_CHUNKING_FAILED",
+            response?.error || "音轨切片失败，请稍后重试"
+        );
+    }
+    return response.result || {};
+}
+
+async function requestOffscreenChunkTranscriptionAll(payload = {}) {
+    return requestOffscreenGroqChunkTranscription(payload);
+}
+
+async function releaseOffscreenAudioChunkSession(sessionId) {
+    if (!sessionId) return;
+    await ensureOffscreenDocument();
+    await chrome.runtime.sendMessage({
+        action: "OFFSCREEN_CHUNK_AUDIO_RELEASE",
+        payload: { sessionId }
+    }).catch(() => {});
+}
+
+async function handleOffscreenChunkProgress(payload = {}) {
+    const tabId = Number(payload?.tabId || 0);
+    const bvid = normalizeBvid(payload?.bvid || "");
+    const chunkIndex = Math.max(1, Number(payload?.chunkIndex || 1));
+    const chunkCount = Math.max(chunkIndex, Number(payload?.chunkCount || chunkIndex));
+    if (!tabId || !bvid) return;
+    const progress = 62 + Math.min(24, Math.round((chunkIndex / Math.max(1, chunkCount)) * 24));
+    const rangeText = `${formatPlaybackTime(Number(payload?.startSec || 0))}-${formatPlaybackTime(Number(payload?.endSec || 0))}`;
+    await updateTabState(tabId, { activeBvid: bvid, transcriptionProgress: progress, updatedAt: Date.now() });
+    await notifyTranscribeStatus(tabId, {
+        stage: "upload",
+        level: "info",
+        text: `正在转录第 ${chunkIndex}/${chunkCount} 段音轨...`,
+        progress,
+        bvid
+    });
+    await recordAsrChunkingProgressState(tabId, {
+        chunkIndex,
+        chunkCount,
+        rangeText
+    });
+}
+
+async function recordAsrChunkingProgressState(tabId, patch = {}) {
+    if (!tabId) return;
+    const current = await getTabState(tabId);
+    const taskRetryState = { ...(current?.taskRetryState || {}) };
+    const previous = taskRetryState.asrChunking && typeof taskRetryState.asrChunking === "object"
+        ? taskRetryState.asrChunking
+        : {};
+    taskRetryState.asrChunking = {
+        ...previous,
+        ...patch,
+        updatedAt: Date.now()
+    };
+    await updateTabState(tabId, { taskRetryState, updatedAt: Date.now() });
+}
+
 function consumeDebugForceFirstSegmentsFailure(taskContext = {}) {
     if (!taskContext || taskContext.debugForceFirstSegmentsFailure !== true) return false;
     taskContext.debugForceFirstSegmentsFailure = false;
@@ -3104,6 +3432,20 @@ async function clearSegmentsDebugState(tabId) {
     const taskRetryState = { ...(current?.taskRetryState || {}) };
     if (!taskRetryState.segments) return;
     delete taskRetryState.segments;
+    await updateTabState(tabId, { taskRetryState, updatedAt: Date.now() });
+}
+
+async function recordAsrChunkingDebugState(tabId, diagnostics = null) {
+    if (!tabId) return;
+    const current = await getTabState(tabId);
+    const taskRetryState = { ...(current?.taskRetryState || {}) };
+    const boundaries = Array.isArray(diagnostics?.boundaries)
+        ? diagnostics.boundaries.slice(0, MAX_ASR_BOUNDARY_DIAGNOSTICS)
+        : [];
+    taskRetryState.asrChunking = {
+        boundaries,
+        updatedAt: Date.now()
+    };
     await updateTabState(tabId, { taskRetryState, updatedAt: Date.now() });
 }
 

@@ -4,17 +4,22 @@
   const STORAGE_KEY = "bilitato_last_seen_version";
 
   const RELEASE_NOTES = {
-    "1.3.1": {
-      title: "Bilitato 已更新至 v1.3.1",
-      displayVersion: "v1.3.1",
-      subtitle: "本次重点补强稳定性和排障能力，集中修复生成链路里的缓存竞态、提示词重置、网络失败归因不清和 Sentry 可观测性不足的问题。",
+    "1.4.0": {
+      title: "Bilitato 已更新至 v1.4.0",
+      displayVersion: "v1.4.0",
+      subtitle: "本次重点升级长音频转录、分段容错和转录稳定性，集中优化超大音轨转录、视频切换串线、按钮状态异常和错误提示不清的问题。",
       groups: [
         {
           tag: "新增",
           items: [
             {
-              title: "错误提示更具体",
-              desc: "细分了超时、Provider 网络失败、模型无权限、阿里云未实名、模型 ID 无效等前端错误提示，并统一补上刷新或重试入口。",
+              title: "长音频自动切片转录",
+              desc: "超出服务限制的音轨现在会先自动切片，再分段转录，减少“音频过大无法转录”的情况。",
+              highlight: true,
+            },
+            {
+              title: "额度说明更清晰",
+              desc: "Groq 和 ModelScope 常用模型的额度说明现在可以直接在设置页查看。",
             },
           ],
         },
@@ -22,17 +27,17 @@
           tag: "修复",
           items: [
             {
-              title: "修复总结与分段状态不同步",
-              desc: "修复总结已完成但分段偶发被旧缓存覆盖成空数组，导致页面误显示尚未生成分段的问题。",
+              title: "修复字幕串到上一个视频",
+              desc: "修复切换视频后偶发沿用旧音轨，导致字幕串线的问题。",
               highlight: true,
             },
             {
-              title: "修复提示词被切换重置",
-              desc: "修复切换 Groq、硅基流动或主 Provider 时，个性化里的自定义提示词被回填成默认值的问题。",
+              title: "修复转录按钮和进度异常",
+              desc: "修复按钮短暂释放、进度条中断后又恢复等问题，转录过程更稳定。",
             },
             {
-              title: "修复本地缓存与配额问题",
-              desc: "增加 unlimitedStorage 和本地缓存兜底，避免字幕缓存过大时反复触发 QUOTA_BYTES 上报。",
+              title: "修复分段生成易失败",
+              desc: "修复分段 JSON、字段缺失、占位值等问题导致整体失败的情况。",
             },
           ],
         },
@@ -40,69 +45,123 @@
           tag: "优化",
           items: [
             {
-              title: "Provider 网络失败无感重试",
-              desc: "普通模型请求遇到短暂网络波动时会自动短退避重试；流式请求仅在首包前失败时补重试一次，减少偶发生成失败。",
+              title: "优化长音频转录体验",
+              desc: "Groq 与硅基流动都补强了超限场景下的自动切片处理能力。",
             },
             {
-              title: "分段空返回自动补救",
-              desc: "分段为空或格式跑偏时，会保留更完整诊断信息，并在合适场景自动尝试更紧凑的补救请求。",
+              title: "优化错误提示",
+              desc: "现在能更明确区分限流、切片失败、自动切片仍超限、时长识别失败等不同原因。",
+            },
+            {
+              title: "优化设置页交互",
+              desc: "下拉项说明提示的位置和展示方式更自然，不再容易被遮挡或裁切。",
             },
           ],
         },
       ],
-      privacy: "本插件不会上传任何 API Key、完整 Prompt 或完整字幕原文。仅在特定 AI 解析失败场景下，会定向上报必要的模型原始返回和结构化诊断信息，用于排查问题。",
+      privacy: "本插件不会上传任何 API Key、Prompt 或您和 AI 的聊天内容。长音频切片与合并在本地完成，仅在实际调用您选择的转录服务时上传必要音频内容。",
     },
-    "1.3.0": {
-      title: "Bilitato 已更新至 v1.3.0",
-      displayVersion: "v1.3.0",
-      subtitle: "本次重点升级模型接入、反馈中心、Provider 设置体验，并继续优化字幕缓存、聊天、总结和转录稳定性。",
+    "1.3.x": {
+      title: "Bilitato v1.3 系列更新回顾",
+      displayVersion: "v1.3.1 - v1.3.0",
+      subtitle: "v1.3 系列的更新总结。",
       groups: [
         {
-          tag: "新增",
-          items: [
+          tag: "v1.3.1",
+          sections: [
             {
-              title: "反馈中心",
-              desc: "现在可以在插件内提交问题与建议，并查看处理状态和回复提醒。",
+              tag: "新增",
+              items: [
+                {
+                  title: "错误提示更具体",
+                  desc: "细分了超时、Provider 网络失败、模型无权限、阿里云未实名、模型 ID 无效等前端错误提示，并统一补上刷新或重试入口。",
+                },
+              ],
             },
             {
-              title: "更多 Provider 支持",
-              desc: "新增 OpenRouter 和 Claude 支持，完善 Gemini、OpenAI、DeepSeek、Kimi、智谱等模型候选项。",
-              highlight: true,
+              tag: "修复",
+              items: [
+                {
+                  title: "修复总结与分段状态不同步",
+                  desc: "修复总结已完成但分段偶发被旧缓存覆盖成空数组，导致页面误显示尚未生成分段的问题。",
+                  highlight: true,
+                },
+                {
+                  title: "修复提示词被切换重置",
+                  desc: "修复切换 Groq、硅基流动或主 Provider 时，个性化里的自定义提示词被回填成默认值的问题。",
+                },
+                {
+                  title: "修复本地缓存与配额问题",
+                  desc: "增加 unlimitedStorage 和本地缓存兜底，避免字幕缓存过大时反复触发 QUOTA_BYTES 上报。",
+                },
+              ],
+            },
+            {
+              tag: "优化",
+              items: [
+                {
+                  title: "Provider 网络失败无感重试",
+                  desc: "普通模型请求遇到短暂网络波动时会自动短退避重试；流式请求仅在首包前失败时补重试一次，减少偶发生成失败。",
+                },
+                {
+                  title: "分段空返回自动补救",
+                  desc: "分段为空或格式跑偏时，会保留更完整诊断信息，并在合适场景自动尝试更紧凑的补救请求。",
+                },
+              ],
             },
           ],
         },
         {
-          tag: "优化",
-          items: [
+          tag: "v1.3.0",
+          sections: [
             {
-              title: "模型设置更好用",
-              desc: "不同 Provider 会分别记忆 API Key 和模型选择，自定义 Provider 支持自动授权域名。",
+              tag: "新增",
+              items: [
+                {
+                  title: "反馈中心",
+                  desc: "现在可以在插件内提交问题与建议，并查看处理状态和回复提醒。",
+                },
+                {
+                  title: "更多 Provider 支持",
+                  desc: "新增 OpenRouter 和 Claude 支持，完善 Gemini、OpenAI、DeepSeek、Kimi、智谱等模型候选项。",
+                  highlight: true,
+                },
+              ],
             },
             {
-              title: "免费额度提示",
-              desc: "ModelScope、Gemini、OpenRouter 增加免费额度标记，悬停即可查看 RPM、RPD 等限额信息。",
+              tag: "优化",
+              items: [
+                {
+                  title: "模型设置更好用",
+                  desc: "不同 Provider 会分别记忆 API Key 和模型选择，自定义 Provider 支持自动授权域名。",
+                },
+                {
+                  title: "免费额度提示",
+                  desc: "ModelScope、Gemini、OpenRouter 增加免费额度标记，悬停即可查看 RPM、RPD 等限额信息。",
+                },
+                {
+                  title: "多模型兼容更稳定",
+                  desc: "优化 OpenRouter、Gemini、Claude、自定义 API 等流式返回解析，减少总结为空和生成失败。",
+                  highlight: true,
+                },
+              ],
             },
             {
-              title: "多模型兼容更稳定",
-              desc: "优化 OpenRouter、Gemini、Claude、自定义 API 等流式返回解析，减少总结为空和生成失败。",
-              highlight: true,
-            },
-          ],
-        },
-        {
-          tag: "修复",
-          items: [
-            {
-              title: "修复字幕缓存读取",
-              desc: "修复本地/云端字幕已存在时，聊天、总结、验真偶发提示暂无字幕的问题。",
-            },
-            {
-              title: "修复转录状态异常",
-              desc: "修复在线转录按钮闪烁、进度回退、下载后短暂误显示无字幕等问题。",
-            },
-            {
-              title: "修复聊天体验问题",
-              desc: "修复聊天报错后页面置底、无字幕状态误上报异常、输入空格和输入法异常等问题。",
+              tag: "修复",
+              items: [
+                {
+                  title: "修复字幕缓存读取",
+                  desc: "修复本地/云端字幕已存在时，聊天、总结、验真偶发提示暂无字幕的问题。",
+                },
+                {
+                  title: "修复转录状态异常",
+                  desc: "修复在线转录按钮闪烁、进度回退、下载后短暂误显示无字幕等问题。",
+                },
+                {
+                  title: "修复聊天体验问题",
+                  desc: "修复聊天报错后页面置底、无字幕状态误上报异常、输入空格和输入法异常等问题。",
+                },
+              ],
             },
           ],
         },
@@ -549,10 +608,10 @@
 
   function buildReleasePageVersions(version) {
     const majorHistory = [];
-    if (version === "1.3.1") {
-      majorHistory.push("1.3.1", "1.3.0", "1.2.x");
-    } else if (version === "1.3.0") {
-      majorHistory.push("1.3.0", "1.2.x");
+    if (version === "1.4.0") {
+      majorHistory.push("1.4.0", "1.3.x", "1.2.x");
+    } else if (version === "1.3.1" || version === "1.3.0" || version === "1.3.x") {
+      majorHistory.push("1.3.x", "1.2.x");
     } else {
       majorHistory.push(version, "1.2.x");
     }
