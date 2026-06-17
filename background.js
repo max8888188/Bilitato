@@ -248,12 +248,17 @@ async function getSentryRuntimeContext() {
         }
     } catch (_) {}
     const manifest = chrome.runtime.getManifest();
+    let userId = "";
+    try {
+        userId = await getOrCreateAnonymousUserId();
+    } catch (_) {}
     return {
         extensionVersion: manifest.version || "",
         manifestVersion: manifest.manifest_version || 3,
         language: navigator.language || "",
         userAgent: navigator.userAgent || "",
-        platform
+        platform,
+        userId
     };
 }
 

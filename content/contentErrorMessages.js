@@ -21,6 +21,15 @@
             action: "goto-setup-guide",
             presentation: "modal"
         },
+        HTTP_402: {
+            title: "模型额度不足或配置不可用",
+            message: "服务商返回 402。常见原因是账号余额/额度不足，免费路由不可用，或当前模型配置不可用。你可以修改配置后直接重试。",
+            actionText: "重试",
+            action: "retry",
+            secondaryActionText: "去设置",
+            secondaryAction: "goto-setup-guide",
+            presentation: "panel"
+        },
         MODEL_ACCESS_DENIED: {
             title: "模型没有访问权限",
             message: "当前账号没有权限使用这个模型，或该模型是私有模型。请切换模型、检查账号权限，或更换 Provider。",

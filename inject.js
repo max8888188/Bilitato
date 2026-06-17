@@ -9,6 +9,7 @@
     let autoTriggerStarted = false;
     let maskNode = null;
     let capturedBvid = "";
+    let capturedRouteKey = "";
     let latestPlayinfo = null; // 存储 XHR 拦截到的最新 dash 数据
     let latestAudioProbe = null;
     let routeMonitorTimer = null;
@@ -267,11 +268,13 @@
 
     function syncCaptureStateWithRoute() {
         const current = String(getBvidFromUrl(location.href) || "").trim();
+        const currentKey = getRouteVideoKey();
         if (!capturedBvid) {
             if (current) capturedBvid = current;
+            if (currentKey) capturedRouteKey = currentKey;
             return;
         }
-        if (current && current !== capturedBvid) {
+        if (current && currentKey && currentKey !== capturedRouteKey) {
             hardResetForRoute(current, "route_switch_reset");
         }
     }
@@ -280,6 +283,7 @@
         isSubtitleCaptured = false;
         autoTriggerStarted = false;
         capturedBvid = String(nextBvid || "").trim();
+        capturedRouteKey = getRouteVideoKey();
         subtitleStringCache = [];
         latestPlayinfo = null; // 切换视频时清空，防止旧视频数据残留
         latestAudioProbe = null;
@@ -294,16 +298,19 @@
         if (routeMonitorTimer) return;
         routeMonitorTimer = setInterval(() => {
             const current = String(getBvidFromUrl(location.href) || "").trim();
+            const currentKey = getRouteVideoKey();
             if (!current) return;
             if (!capturedBvid) {
                 capturedBvid = current;
+                capturedRouteKey = currentKey;
                 emitPlayInfo(); // Emit when first BVID captured
                 return;
             }
-            if (current === capturedBvid) return;
+            if (currentKey && currentKey === capturedRouteKey) return;
             
             // Immediately dispatch postMessage on detection without delay
-            window.postMessage({ type: "BILI_ROUTE_SWITCH", bvid: current }, "*");
+            const meta = resolvePageMeta();
+            window.postMessage({ type: "BILI_ROUTE_SWITCH", bvid: current, cid: meta.cid || 0, tid: getRouteTid() }, "*");
             
             routeMetaReadyAt = Date.now() + 800;
             hardResetForRoute(current, "route_monitor");
@@ -350,6 +357,7 @@
         const state = window.__INITIAL_STATE__ || {};
         const playInfo = window.__playinfo__ || {};
         const bvidFromPath = getBvidFromUrl(location.href);
+        const pageCid = getCidFromPages(state?.videoData?.pages);
         const bvid = String(
             state?.bvid ||
             state?.videoData?.bvid ||
@@ -359,11 +367,11 @@
             ""
         ).trim();
         const cid = Number(
-            state?.videoData?.cid ||
+            pageCid ||
             state?.cid ||
             state?.epInfo?.cid ||
             playInfo?.data?.cid ||
-            getCidFromPages(state?.videoData?.pages) ||
+            state?.videoData?.cid ||
             0
         );
         return { bvid, cid: Number.isFinite(cid) ? cid : 0 };
@@ -380,6 +388,16 @@
     function getBvidFromUrl(url) {
         const match = String(url || "").match(/\/video\/(BV[0-9A-Za-z]+)/i);
         return match ? match[1] : "";
+    }
+
+    function getRouteTid() {
+        const parsed = new URL(location.href);
+        return parsed.searchParams.get("p") || "";
+    }
+
+    function getRouteVideoKey() {
+        const bvid = String(getBvidFromUrl(location.href) || "").trim();
+        return bvid ? `${bvid}|${getRouteTid()}` : "";
     }
 
     function emitPlayInfo() {

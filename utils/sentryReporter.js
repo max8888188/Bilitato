@@ -83,6 +83,7 @@ export function createSentryEvent(errorInput, context = {}, runtime = {}) {
   const safeContext = sanitizeForSentry(context);
   const errorMeta = resolveErrorMeta(errorInput, safeContext);
   const extensionVersion = String(runtime.extensionVersion || safeContext.extensionVersion || "").trim();
+  const sentryUserId = String(runtime.userId || safeContext.userId || "").trim() || "anonymous";
   const provider = String(safeContext.provider || "").trim();
   const model = String(safeContext.model || "").trim();
   const task = String(safeContext.task || "").trim();
@@ -109,7 +110,7 @@ export function createSentryEvent(errorInput, context = {}, runtime = {}) {
       manifest_version: runtime.manifestVersion
     }),
     user: {
-      id: "anonymous"
+      id: sentryUserId
     },
     contexts: {
       runtime: removeEmpty({

@@ -312,7 +312,7 @@ const CACHE_SYNC_THROTTLE_MS = 500;
 const SUBTITLE_OBSERVE_GRACE_MS = 3500;
 const STEP_PROGRESS_TIMEOUT_MS = 60000;
 const CLOUD_READ_TIMEOUT_MS = 1000;
-const FEEDBACK_POLL_INTERVAL_MS = 60000;
+const FEEDBACK_SUBMITTED_STORAGE_KEY = "feedbackSubmitted";
 const FEEDBACK_PENDING_REPLY_TEXT = "感谢你的反馈！我会尽量在24小时内回复。";
 const appState = {
     tabId: null,
@@ -357,6 +357,7 @@ const appState = {
     lastSubtitleForwardAt: 0,
     routeWatchTimer: null,
     routeWatchBvid: "",
+    routeWatchKey: "",
     subtitleTimeline: [],
     transcription: {
         phase: "idle",
@@ -431,7 +432,7 @@ const appState = {
         content: "",
         includeLogs: true
     },
-    feedbackPollTimer: null,
+    feedbackHasSubmission: false,
     feedbackSeenTimer: null,
     feedbackVisibleUnreadIds: new Set(),
     playInfo: null,
@@ -453,6 +454,31 @@ function getFeedbackState() {
         loadedAt: 0,
         ...(appState.feedback || {})
     };
+}
+
+async function setFeedbackSubmissionState(submitted) {
+    const nextValue = !!submitted;
+    appState.feedbackHasSubmission = nextValue;
+    try {
+        await chrome.storage.local.set({ [FEEDBACK_SUBMITTED_STORAGE_KEY]: nextValue });
+    } catch (_) {}
+}
+
+async function loadFeedbackSubmissionState(feedback = null) {
+    const hasRows = Array.isArray(feedback?.rows) && feedback.rows.length > 0;
+    if (hasRows) {
+        await setFeedbackSubmissionState(true);
+        return true;
+    }
+    try {
+        const stored = await chrome.storage.local.get([FEEDBACK_SUBMITTED_STORAGE_KEY]);
+        const submitted = stored?.[FEEDBACK_SUBMITTED_STORAGE_KEY] === true;
+        appState.feedbackHasSubmission = submitted;
+        return submitted;
+    } catch (_) {
+        appState.feedbackHasSubmission = false;
+        return false;
+    }
 }
 
 function setFeedbackState(patch = {}) {
@@ -922,7 +948,22 @@ async function onInjectMessage(event) {
         // Notify background to abort ongoing transcription for previous BVID
         chrome.runtime.sendMessage({ action: "ABORT_TRANSCRIPTION", bvid: getTranscriptionBvid() }).catch(() => {});
         resetAllState();
-        waitForAlignedPlayInfo(normalizeBvidCase(getBvidFromUrl(location.href) || "")).catch(() => {});
+        const routeBvid = normalizeBvidCase(getBvidFromUrl(location.href) || "");
+        const routeCid = Number(event.data?.cid || 0);
+        appState.routeWatchBvid = routeBvid;
+        appState.routeWatchKey = getCurrentRouteVideoKey();
+        appState.injectBvid = routeBvid;
+        appState.injectCid = Number.isFinite(routeCid) && routeCid > 0 ? routeCid : 0;
+        appState.tabState = {
+            ...(appState.tabState || {}),
+            activeBvid: routeBvid || appState.tabState?.activeBvid || "",
+            activeCid: appState.injectCid,
+            activeTid: getRoutePartId() || null,
+            updatedAt: Date.now()
+        };
+        clearCCListImmediately();
+        renderContent();
+        waitForAlignedPlayInfo(routeBvid).catch(() => {});
         return;
     }
     if (msgType !== "BILI_SUBTITLE_DATA") return;
@@ -1021,7 +1062,7 @@ function onStorageChanged(changes, areaName) {
             .map((key) => changes[key]?.newValue)
             .find((cache) => {
                 const cacheBvid = normalizeBvidCase(cache?.bvid || "");
-                return cacheBvid && (!currentRoute || cacheBvid === currentRoute);
+                return cacheBvid && (!currentRoute || cacheBvid === currentRoute) && isCacheForCurrentRouteVideo(cache, currentRoute || afterBvid || beforeBvid);
             });
         if (nextCache) {
             appState.cache = nextCache;
@@ -1571,6 +1612,9 @@ async function loadBootstrapData() {
             statusText: "",
             errorText: ""
         });
+        await loadFeedbackSubmissionState(res.feedback);
+    } else {
+        await loadFeedbackSubmissionState(null);
     }
     let previewTarget = null;
     try {
@@ -1594,7 +1638,6 @@ function renderApp() {
     renderNav();
     renderContent();
     renderTopRemaining();
-    startFeedbackAutoPolling();
     maybeAutoShowSetupGuideOnFirstRun();
     globalThis.BilitatoReleaseNotice?.maybeShowReleaseNotice({
         root: panelShadowRoot,
@@ -2267,6 +2310,11 @@ function ensureFeedbackLoadedForSettings() {
     refreshFeedbackState({ markSeen: false, silent: true });
 }
 
+function refreshFeedbackAfterVideoSwitch() {
+    if (!appState.feedbackHasSubmission) return;
+    refreshFeedbackState({ markSeen: false, silent: true });
+}
+
 function scheduleFeedbackSeenAfterDisplay() {
     if (appState.activePage !== "settings") return;
     const rows = getFeedbackState().rows || [];
@@ -2281,14 +2329,6 @@ function scheduleFeedbackSeenAfterDisplay() {
         if (appState.activePage !== "settings") return;
         refreshFeedbackState({ markSeen: true, silent: true });
     }, 800);
-}
-
-function startFeedbackAutoPolling() {
-    if (appState.feedbackPollTimer) return;
-    appState.feedbackPollTimer = setInterval(() => {
-        if (document.visibilityState === "hidden") return;
-        refreshFeedbackState({ markSeen: false, silent: true });
-    }, FEEDBACK_POLL_INTERVAL_MS);
 }
 
 async function submitFeedbackFromPanel() {
@@ -2330,6 +2370,7 @@ async function submitFeedbackFromPanel() {
             statusText: FEEDBACK_PENDING_REPLY_TEXT,
             errorText: ""
         });
+        await setFeedbackSubmissionState(true);
         appState.feedbackDraft = { type: "bug", title: "", content: "", includeLogs: true };
         showToast("反馈已提交");
         renderNav();
@@ -5188,10 +5229,13 @@ function isAsrSubtitleSourceValue(source) {
 function applyCacheSubtitleState(cache, targetBvid = "") {
     const target = normalizeBvidCase(targetBvid || cache?.bvid || resolveCurrentBvid() || "");
     if (!target || !cache || normalizeBvidCase(cache?.bvid || "") !== target) return;
+    if (!isCacheForCurrentRouteVideo(cache, target)) return;
     const subtitleSource = String(cache?.subtitleSource || "");
     appState.tabState = {
         ...(appState.tabState || {}),
         activeBvid: target,
+        activeCid: Number(cache?.cid || appState.tabState?.activeCid || 0),
+        activeTid: cache?.tid || appState.tabState?.activeTid || null,
         subtitleSource: subtitleSource || appState.tabState?.subtitleSource || "",
         transcriptionProgress: isAsrSubtitleSourceValue(subtitleSource)
             ? 100
@@ -5224,13 +5268,13 @@ function startCloudReadForCurrentVideo(options = {}) {
                 return;
             }
             const cache = res?.cache || null;
-            const cacheUpdated = !!(cache && normalizeBvidCase(cache?.bvid || "") === target);
-            if (cache && normalizeBvidCase(cache?.bvid || "") === target) {
+            const cacheUpdated = !!(cache && normalizeBvidCase(cache?.bvid || "") === target && isCacheForCurrentRouteVideo(cache, target));
+            if (cache && normalizeBvidCase(cache?.bvid || "") === target && isCacheForCurrentRouteVideo(cache, target)) {
                 appState.cache = cache;
                 applyCacheSubtitleState(cache, target);
             }
             if (res?.tabState) appState.tabState = res.tabState;
-            if (cache && normalizeBvidCase(cache?.bvid || "") === target) {
+            if (cache && normalizeBvidCase(cache?.bvid || "") === target && isCacheForCurrentRouteVideo(cache, target)) {
                 applyCacheSubtitleState(cache, target);
             }
             appState.cloudReadState = createCloudReadState(target, "success", nextRequestId);
@@ -6606,11 +6650,42 @@ function hasUsableSubtitleCache(cache, targetBvid = "") {
     const cacheBvid = normalizeBvidCase(cache?.bvid || "");
 
     if (target && cacheBvid && target !== cacheBvid) return false;
+    if (!isCacheForCurrentRouteVideo(cache, target)) return false;
 
     return (
         (Array.isArray(cache?.rawSubtitle) && cache.rawSubtitle.length > 0) ||
         (Array.isArray(cache?.processedSubtitle) && cache.processedSubtitle.length > 0)
     );
+}
+
+function getCurrentRouteVideoKey() {
+    const bvid = normalizeBvidCase(getBvidFromUrl(location.href) || resolveCurrentBvid() || "");
+    const tid = getRoutePartId();
+    return bvid ? `${bvid}|${tid}` : "";
+}
+
+function getRoutePartId() {
+    try {
+        return String(new URL(location.href).searchParams.get("p") || "").trim();
+    } catch (_) {
+        return "";
+    }
+}
+
+function isCacheForCurrentRouteVideo(cache, targetBvid = "") {
+    if (!cache) return false;
+    const target = normalizeBvidCase(targetBvid || resolveCurrentBvid() || "");
+    const cacheBvid = normalizeBvidCase(cache?.bvid || "");
+    if (target && cacheBvid && target !== cacheBvid) return false;
+
+    const routeBvid = normalizeBvidCase(getBvidFromUrl(location.href) || "");
+    const routeTid = getRoutePartId();
+    if (routeBvid && cacheBvid && routeBvid !== cacheBvid) return false;
+    if (!routeTid) return true;
+
+    const cacheTid = String(cache?.tid || "").trim();
+    if (cacheTid) return cacheTid === routeTid;
+    return false;
 }
 
 function makeShortDigest(value) {
@@ -7021,12 +7096,16 @@ function scheduleInjectRetry() {
 function startRouteWatcher() {
     if (appState.routeWatchTimer) return;
     appState.routeWatchBvid = getBvidFromUrl(location.href);
+    appState.routeWatchKey = getCurrentRouteVideoKey();
     appState.routeWatchTimer = setInterval(() => {
         const current = getBvidFromUrl(location.href);
-        if (!current || current === appState.routeWatchBvid) return;
+        const currentKey = getCurrentRouteVideoKey();
+        if (!current || !currentKey || currentKey === appState.routeWatchKey) return;
         const prev = appState.routeWatchBvid || "";
+        const prevKey = appState.routeWatchKey || "";
         appState.routeWatchBvid = current;
-        pushSubtitleTimeline("route_switch", { from: prev, to: current });
+        appState.routeWatchKey = currentKey;
+        pushSubtitleTimeline("route_switch", { from: prev, to: current, fromKey: prevKey, toKey: currentKey });
         resetAllState();
         clearStreamCache();
         appState.pendingSubtitle = null;
@@ -7036,6 +7115,7 @@ function startRouteWatcher() {
             ...(appState.tabState || {}),
             activeBvid: current,
             activeCid: 0,
+            activeTid: getRoutePartId() || null,
             updatedAt: Date.now(),
             taskStatus: {
                 ...(appState.tabState?.taskStatus || {}),
@@ -7046,6 +7126,7 @@ function startRouteWatcher() {
             }
         };
         appState.injectBvid = current;
+        appState.injectCid = 0;
         appState.injectBvidChangedAt = Date.now();
         appState.isStateDirty = true;
         startSubtitleCheckTimer();
@@ -7053,6 +7134,7 @@ function startRouteWatcher() {
         clearCCListImmediately();
         renderContent();
         syncCacheFromBackground(current);
+        refreshFeedbackAfterVideoSwitch();
         scheduleSubtitleFallbackWatchdog("route_switch");
     }, 500);
 }
@@ -7222,7 +7304,7 @@ async function syncActiveCacheByBvid(expectedBvid) {
         const res = await chrome.storage.local.get([`cache_${target}`]);
         if (normalizeBvidCase(appState.tabState?.activeBvid || "") !== target) return;
         const nextCache = res?.[`cache_${target}`] || null;
-        appState.cache = nextCache && normalizeBvidCase(nextCache?.bvid || "") === target ? nextCache : null;
+        appState.cache = nextCache && normalizeBvidCase(nextCache?.bvid || "") === target && isCacheForCurrentRouteVideo(nextCache, target) ? nextCache : null;
         applyCacheSubtitleState(appState.cache, target);
         if (hasUsableSubtitleCache(appState.cache, target)) {
             appState.subtitleCapturedBvid = target;
@@ -7299,7 +7381,7 @@ async function syncCacheFromBackground(bvid, options = {}) {
         const routeBvid = normalizeBvidCase(getBvidFromUrl(location.href));
         if (routeBvid && routeBvid !== target) return;
         const cache = res.cache || null;
-        if (!cache || normalizeBvidCase(cache?.bvid || "") !== target) {
+        if (!cache || normalizeBvidCase(cache?.bvid || "") !== target || !isCacheForCurrentRouteVideo(cache, target)) {
             if (options.preserveCacheOnMiss !== true) {
                 appState.cache = null;
             }
@@ -7571,7 +7653,7 @@ function onBackgroundMessage(message) {
     appState.pendingSubtitle = null;
     renderNav();
     const messageCacheBvid = normalizeBvidCase(cache?.bvid || "");
-    appState.cache = cache && (!routeBvid || messageCacheBvid === routeBvid) ? cache : null;
+    appState.cache = cache && (!routeBvid || messageCacheBvid === routeBvid) && isCacheForCurrentRouteVideo(cache, payloadBvid || routeBvid) ? cache : null;
     if (appState.cache) {
         applyCacheSubtitleState(appState.cache, payloadBvid || routeBvid);
     }
