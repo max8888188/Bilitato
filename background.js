@@ -26,6 +26,7 @@ import { normalizeRumors as normalizeRumorsResult, normalizeSegments as normaliz
 import { reportToSentry } from "./utils/sentryReporter.js";
 import { createAppError, createHttpError, serializeAppError } from "./utils/appError.js";
 import { isSupabaseEnabled, supabaseRpc, supabaseSelect, supabaseWrite } from "./utils/supabaseClient.js";
+import { reportUsageEvent } from "./utils/usageEvents.js";
 import "./logger.js";
 
 let IS_DEBUG_MODE = false;
@@ -41,8 +42,7 @@ const STREAM_INITIAL_RETRY_DELAY_MS = 700;
 const OFFSCREEN_DOCUMENT_PATH = "offscreen.html";
 let offscreenDocumentPromise = null;
 const MAX_ASR_BOUNDARY_DIAGNOSTICS = 8;
-
-
+const USAGE_EVENT_SESSION_ID = createUsageEventSessionId();
 
 function syncRuntimeDebugFlag(enabled) {
     IS_DEBUG_MODE = !!enabled;
@@ -260,6 +260,56 @@ async function getSentryRuntimeContext() {
         platform,
         userId
     };
+}
+
+function createUsageEventSessionId() {
+    if (crypto?.randomUUID) return crypto.randomUUID();
+    return `usage_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 12)}`;
+}
+
+async function getUsageUserHash() {
+    const userId = await getOrCreateAnonymousUserId();
+    return sha256Hex(`usage:${userId}`);
+}
+
+function buildUsageEventMetadata(payload = {}) {
+    return {
+        ...(payload.metadata && typeof payload.metadata === "object" ? payload.metadata : {}),
+        tab_id: payload.tabId || undefined
+    };
+}
+
+function buildUsageErrorPayload(error, fallback = {}) {
+    return {
+        status: error?.code === "ABORTED" ? "cancelled" : resolveUsageStatusByError(error),
+        errorCode: resolveUsageErrorCode(error, fallback.errorCode || "TASK_FAILED"),
+        durationMs: Math.max(0, Date.now() - Number(fallback.startedAt || Date.now())),
+        metadata: {
+            message: String(error?.message || "").slice(0, 300),
+            ...(fallback.metadata && typeof fallback.metadata === "object" ? fallback.metadata : {})
+        }
+    };
+}
+
+async function reportClientUsageEvent(payload = {}, settingsInput = null) {
+    try {
+        const settings = settingsInput || await getResolvedSettings();
+        const manifest = chrome.runtime.getManifest();
+        return await reportUsageEvent(settings, {
+            ...payload,
+            userHash: await getUsageUserHash(),
+            sessionId: USAGE_EVENT_SESSION_ID,
+            extensionVersion: manifest.version || "",
+            metadata: buildUsageEventMetadata(payload)
+        });
+    } catch (error) {
+        logBackground.warn("usage_event_report_failed", {
+            task: "usage_event",
+            code: error?.code || "",
+            detail: { message: error?.message || "" }
+        });
+        return { sent: false, reason: "error" };
+    }
 }
 
 function createFeedbackClientId() {
@@ -846,6 +896,13 @@ async function handleMessage(msg, sender) {
     if (msg.action === "MARK_FEEDBACK_SEEN") {
         const settings = await getResolvedSettings();
         return { feedback: await fetchFeedbackState(settings, { markSeen: true }) };
+    }
+    if (msg.action === "REPORT_USAGE_EVENT") {
+        const settings = await getResolvedSettings();
+        return await reportClientUsageEvent({
+            ...(msg.payload && typeof msg.payload === "object" ? msg.payload : {}),
+            tabId: msg.tabId || sender.tab?.id || 0
+        }, settings);
     }
     if (msg.action === "SET_RUNTIME_DEBUG") {
         currentDebugMode = !!msg.enabled;
@@ -1569,7 +1626,31 @@ class ContentProvider {
         const asrDisplayName = asrProvider === "siliconflow" ? "硅基流动" : "Groq";
         const subtitleSource = asrProvider === "siliconflow" ? "siliconflow" : "groq";
         const startedAt = Date.now();
-        if (!asrApiKey) throw new Error(asrProvider === "siliconflow" ? "请先在设置中填写硅基流动 API Key" : "请先在设置中填写 Groq API Key");
+        await reportClientUsageEvent({
+            eventName: "task_started",
+            featureName: "transcribe",
+            status: "started",
+            provider: asrProvider,
+            model: asrModel,
+            bvid,
+            title,
+            tabId
+        }, normalizedSettings);
+        if (!asrApiKey) {
+            const error = createAppError("MISSING_API_KEY", asrProvider === "siliconflow" ? "请先在设置中填写硅基流动 API Key" : "请先在设置中填写 Groq API Key");
+            await reportClientUsageEvent({
+                eventName: "task_failed",
+                featureName: "transcribe",
+                provider: asrProvider,
+                model: asrModel,
+                bvid,
+                title,
+                tabId,
+                ...buildUsageErrorPayload(error, { startedAt, errorCode: "MISSING_API_KEY" })
+            }, normalizedSettings);
+            error.__usageEventReported = true;
+            throw error;
+        }
         const asrRunId = String(payload?.asrRunId || `asr_${bvid}_${startedAt.toString(36)}`).trim();
         const payloadAudioSummary = await summarizeMediaLocator(payload?.audioUrl || "");
         const operationController = new AbortController();
@@ -1790,8 +1871,36 @@ class ContentProvider {
                 model: asrModel,
                 title: title || media.title || ""
             });
+            await reportClientUsageEvent({
+                eventName: "task_success",
+                featureName: "transcribe",
+                status: "success",
+                provider: asrProvider,
+                model: asrModel,
+                bvid,
+                title: title || media.title || "",
+                durationMs: Date.now() - startedAt,
+                tabId,
+                metadata: {
+                    rows: rows.length,
+                    chunked: !!transcription?.meta?.chunked,
+                    chunk_count: Number(transcription?.meta?.chunkCount || 0) || undefined
+                }
+            }, normalizedSettings);
             return { rows: rows.length, quota: transcription.quota };
         } catch (error) {
+            if (!error?.__usageEventReported) {
+                await reportClientUsageEvent({
+                    eventName: error?.code === "ABORTED" ? "task_cancelled" : "task_failed",
+                    featureName: "transcribe",
+                    provider: asrProvider,
+                    model: asrModel,
+                    bvid,
+                    title,
+                    tabId,
+                    ...buildUsageErrorPayload(error, { startedAt, errorCode: "ASR_FAILED" })
+                }, normalizedSettings);
+            }
             await updateTabState(tabId, { activeBvid: bvid, transcriptionProgress: 0, updatedAt: Date.now() });
             await notifyTranscribeStatus(tabId, {
                 stage: "error",
@@ -2672,6 +2781,16 @@ async function runSingleTask(tabId, bvid, task, force, settings, taskContext = {
     const key = `${bvid}|${task}`;
     const startedAt = Date.now();
     logBackground.info("task_start", { tab_id: tabId, bvid, task });
+    await reportClientUsageEvent({
+        eventName: "task_started",
+        featureName: task,
+        status: "started",
+        provider: settings?.provider || "",
+        model: settings?.model || "",
+        bvid,
+        title: cache?.title || "",
+        tabId
+    }, settings);
     try {
         const result = await runWithDedup(key, () => requestTaskResult(bvid, task, settings, { ...taskContext, tabId }));
         await mergeCacheByBvid(bvid, {
@@ -2683,6 +2802,17 @@ async function runSingleTask(tabId, bvid, task, force, settings, taskContext = {
         if (cloudSaved) {
             await incrementCloudVideoCallCount(bvid, settings, task);
         }
+        await reportClientUsageEvent({
+            eventName: "task_success",
+            featureName: task,
+            status: "success",
+            provider: settings?.provider || "",
+            model: settings?.model || "",
+            bvid,
+            title: cache?.title || "",
+            durationMs: Date.now() - startedAt,
+            tabId
+        }, settings);
         return result;
     } catch (error) {
         const status = isTimeoutError(error) ? "timeout" : "error";
@@ -2702,6 +2832,16 @@ async function runSingleTask(tabId, bvid, task, force, settings, taskContext = {
             bvid,
             title: cache?.title || ""
         });
+        await reportClientUsageEvent({
+            eventName: "task_failed",
+            featureName: task,
+            provider: settings?.provider || "",
+            model: settings?.model || "",
+            bvid,
+            title: cache?.title || "",
+            tabId,
+            ...buildUsageErrorPayload(error, { startedAt })
+        }, settings);
         if (status === "timeout") {
             logBackground.error("task_timeout", buildFailureLog(error, { tab_id: tabId, bvid, task, code: error?.code || "TIMEOUT" }));
         } else {
@@ -2727,10 +2867,36 @@ async function runSummarySegmentsTasks(tabId, bvid, force, settings, taskContext
     const key = `${bvid}|summary_segments`;
     const startedAt = Date.now();
     logBackground.info("task_start", { tab_id: tabId, bvid, task: "summary_segments", mode: settings.prefMode });
+    await reportClientUsageEvent({
+        eventName: "task_started",
+        featureName: "summary_segments_merged",
+        status: "started",
+        provider: settings?.provider || "",
+        model: settings?.model || "",
+        bvid,
+        title: cache?.title || "",
+        tabId,
+        metadata: { pref_mode: settings?.prefMode || "" }
+    }, settings);
     const runner = settings.prefMode === "efficiency"
         ? () => runSummarySegmentsInEfficiency(tabId, bvid, force, settings, taskContext)
         : () => runSummarySegmentsInQuality(tabId, bvid, force, settings, taskContext);
-    const results = await runWithDedup(key, runner);
+    let results;
+    try {
+        results = await runWithDedup(key, runner);
+    } catch (error) {
+        await reportClientUsageEvent({
+            eventName: "task_failed",
+            featureName: "summary_segments_merged",
+            provider: settings?.provider || "",
+            model: settings?.model || "",
+            bvid,
+            title: cache?.title || "",
+            tabId,
+            ...buildUsageErrorPayload(error, { startedAt, errorCode: "SUMMARY_SEGMENTS_FAILED" })
+        }, settings);
+        throw error;
+    }
     const cloudPatch = {};
     if (results?.summary?.ok) cloudPatch.summary = results.summary.data;
     if (results?.segments?.ok) cloudPatch.segments = results.segments.data;
@@ -2756,8 +2922,30 @@ async function runSummarySegmentsTasks(tabId, bvid, force, settings, taskContext
             bvid,
             title: cache?.title || ""
         });
+        await reportClientUsageEvent({
+            eventName: "task_failed",
+            featureName: "summary_segments_merged",
+            provider: settings?.provider || "",
+            model: settings?.model || "",
+            bvid,
+            title: cache?.title || "",
+            tabId,
+            ...buildUsageErrorPayload(error, { startedAt, errorCode: "SUMMARY_SEGMENTS_FAILED" })
+        }, settings);
         throw error;
     }
+    await reportClientUsageEvent({
+        eventName: summaryOk && segmentsOk ? "task_success" : "task_partial",
+        featureName: "summary_segments_merged",
+        status: summaryOk && segmentsOk ? "success" : "partial",
+        provider: settings?.provider || "",
+        model: settings?.model || "",
+        bvid,
+        title: cache?.title || "",
+        durationMs: Date.now() - startedAt,
+        tabId,
+        metadata: { summary_ok: summaryOk, segments_ok: segmentsOk }
+    }, settings);
     return results;
 }
 
@@ -2777,6 +2965,16 @@ async function runChatForTab(tabId, text, messageId, requestedBvid = "") {
     const startedAt = Date.now();
     logBackground.info("task_enqueue", { tab_id: tabId, bvid, tasks: ["chat"] });
     logBackground.info("task_start", { tab_id: tabId, bvid, task: "chat" });
+    await reportClientUsageEvent({
+        eventName: "task_started",
+        featureName: "chat",
+        status: "started",
+        provider: resolvedSettings?.provider || "",
+        model: resolvedSettings?.model || "",
+        bvid,
+        title: cache?.title || "",
+        tabId
+    }, resolvedSettings);
     try {
         let lastMetrics = null;
         const answer = await runWithDedup(key, async () => {
@@ -2799,6 +2997,18 @@ async function runChatForTab(tabId, text, messageId, requestedBvid = "") {
         ];
         await mergeCacheByBvid(bvid, { history: mergedHistory, updatedAt: Date.now() });
         await setTaskStatus(tabId, ["chat"], "done");
+        await reportClientUsageEvent({
+            eventName: "task_success",
+            featureName: "chat",
+            status: "success",
+            provider: resolvedSettings?.provider || "",
+            model: resolvedSettings?.model || "",
+            bvid,
+            title: cache?.title || "",
+            durationMs: Date.now() - startedAt,
+            tokenCount: lastMetrics?.totalTokens || 0,
+            tabId
+        }, resolvedSettings);
         logBackground.info("task_finish", { tab_id: tabId, bvid, tasks: ["chat"] });
         return { answer, metrics: lastMetrics || null };
     } catch (error) {
@@ -2810,6 +3020,16 @@ async function runChatForTab(tabId, text, messageId, requestedBvid = "") {
             bvid,
             title: cache?.title || ""
         });
+        await reportClientUsageEvent({
+            eventName: "task_failed",
+            featureName: "chat",
+            provider: resolvedSettings?.provider || "",
+            model: resolvedSettings?.model || "",
+            bvid,
+            title: cache?.title || "",
+            tabId,
+            ...buildUsageErrorPayload(error, { startedAt, errorCode: "CHAT_FAILED" })
+        }, resolvedSettings);
         if (status === "timeout") {
             logBackground.error("task_timeout", buildFailureLog(error, { tab_id: tabId, bvid, task: "chat", code: error?.code || "TIMEOUT" }));
         } else {
@@ -2844,6 +3064,17 @@ async function runChatForPort(port, msg) {
     const startedAt = Date.now();
     logBackground.info("task_enqueue", { tab_id: tabId, bvid, tasks: ["chat_stream"] });
     logBackground.info("task_start", { tab_id: tabId, bvid, task: "chat_stream" });
+    await reportClientUsageEvent({
+        eventName: "task_started",
+        featureName: "chat",
+        status: "started",
+        provider: resolvedSettings?.provider || "",
+        model: resolvedSettings?.model || "",
+        bvid,
+        title: cache?.title || "",
+        tabId,
+        metadata: { stream: true }
+    }, resolvedSettings);
     try {
         let lastMetrics = null;
         const answer = await runWithDedup(key, async () => {
@@ -2872,6 +3103,19 @@ async function runChatForPort(port, msg) {
         ];
         await mergeCacheByBvid(bvid, { history: mergedHistory, updatedAt: Date.now() });
         await setTaskStatus(tabId, ["chat"], "done");
+        await reportClientUsageEvent({
+            eventName: "task_success",
+            featureName: "chat",
+            status: "success",
+            provider: resolvedSettings?.provider || "",
+            model: resolvedSettings?.model || "",
+            bvid,
+            title: cache?.title || "",
+            durationMs: Date.now() - startedAt,
+            tokenCount: lastMetrics?.totalTokens || 0,
+            tabId,
+            metadata: { stream: true }
+        }, resolvedSettings);
         safePortPost(port, { type: "done", messageId, answer, metrics: lastMetrics || null });
         logBackground.info("task_finish", { tab_id: tabId, bvid, tasks: ["chat_stream"] });
     } catch (error) {
@@ -2883,6 +3127,16 @@ async function runChatForPort(port, msg) {
                 bvid,
                 title: cache?.title || ""
             });
+            await reportClientUsageEvent({
+                eventName: "task_cancelled",
+                featureName: "chat",
+                provider: resolvedSettings?.provider || "",
+                model: resolvedSettings?.model || "",
+                bvid,
+                title: cache?.title || "",
+                tabId,
+                ...buildUsageErrorPayload(error, { startedAt, errorCode: "ABORTED", metadata: { stream: true } })
+            }, resolvedSettings);
             await setTaskStatus(tabId, ["chat"], "done");
             safePortPost(port, { type: "aborted", messageId });
             return;
@@ -2895,6 +3149,16 @@ async function runChatForPort(port, msg) {
             bvid,
             title: cache?.title || ""
         });
+        await reportClientUsageEvent({
+            eventName: "task_failed",
+            featureName: "chat",
+            provider: resolvedSettings?.provider || "",
+            model: resolvedSettings?.model || "",
+            bvid,
+            title: cache?.title || "",
+            tabId,
+            ...buildUsageErrorPayload(error, { startedAt, errorCode: "CHAT_STREAM_FAILED", metadata: { stream: true } })
+        }, resolvedSettings);
         if (status === "timeout") {
             logBackground.error("task_timeout", buildFailureLog(error, { tab_id: tabId, bvid, task: "chat_stream", code: error?.code || "TIMEOUT" }));
         } else {

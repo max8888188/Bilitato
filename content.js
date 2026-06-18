@@ -435,6 +435,7 @@ const appState = {
     feedbackHasSubmission: false,
     feedbackSeenTimer: null,
     feedbackVisibleUnreadIds: new Set(),
+    lastSettingsUsageEventSignature: "",
     playInfo: null,
     playInfoUpdatedAt: 0,
     isPlayInfoReady: false,
@@ -454,6 +455,31 @@ function getFeedbackState() {
         loadedAt: 0,
         ...(appState.feedback || {})
     };
+}
+
+function reportUsageEvent(payload = {}) {
+    try {
+        const settings = appState.settings || {};
+        const bvid = normalizeBvidCase(payload.bvid || resolveCurrentBvid() || appState.tabState?.activeBvid || "");
+        const provider = String(payload.provider || settings.provider || "").trim();
+        const providerModels = settings.providerModels && typeof settings.providerModels === "object" ? settings.providerModels : {};
+        const model = String(payload.model || providerModels[provider] || settings.model || "").trim();
+        const result = chrome.runtime?.sendMessage?.({
+            action: "REPORT_USAGE_EVENT",
+            payload: {
+                ...payload,
+                provider,
+                model,
+                bvid,
+                title: payload.title || cleanBilibiliTitle(document.title),
+                metadata: {
+                    active_page: appState.activePage || "",
+                    ...(payload.metadata && typeof payload.metadata === "object" ? payload.metadata : {})
+                }
+            }
+        });
+        if (result && typeof result.catch === "function") result.catch(() => {});
+    } catch (_) {}
 }
 
 async function setFeedbackSubmissionState(submitted) {
@@ -849,6 +875,12 @@ async function bootstrap() {
     startRouteWatcher();
     await waitPanelMount();
     await loadBootstrapData();
+    reportUsageEvent({
+        eventName: "extension_started",
+        featureName: "extension",
+        status: "started",
+        metadata: { route_key: getCurrentRouteVideoKey() }
+    });
     globalThis.AIPluginLogger?.setDebugEnabled?.(isDebugLoggingEnabled());
     appState.injectBvid = normalizeBvidCase(getBvidFromUrl(location.href) || appState.tabState?.activeBvid || "");
     appState.injectBvidChangedAt = Date.now();
@@ -1767,6 +1799,11 @@ function bindPanelDelegatedEvents() {
                 setFeedbackState({ statusText: "", errorText: "" });
             }
             appState.activePage = navId;
+            reportUsageEvent({
+                eventName: "panel_opened",
+                featureName: navId,
+                status: "opened"
+            });
             setNavActionActive("");
             renderNav();
             renderContent();
@@ -1774,6 +1811,7 @@ function bindPanelDelegatedEvents() {
         }
         const transcribeNode = event.target.closest("#start-groq-transcribe");
         if (transcribeNode) {
+            reportRetryClickIfNeeded(["transcribe"], "start_transcribe");
             startTranscriptionFromCapsule();
             return;
         }
@@ -1783,16 +1821,19 @@ function bindPanelDelegatedEvents() {
         if (action === "run-summary") {
             logUI.info("ui_generate_summary", { tab_id: appState.tabId || null });
             logUI.info("ui_generate_segments", { tab_id: appState.tabId || null });
+            reportRetryClickIfNeeded(["summary", "segments"], action);
             runTasks(["summary", "segments"]);
             return;
         }
         if (action === "run-segments") {
             logUI.info("ui_generate_segments", { tab_id: appState.tabId || null });
+            reportRetryClickIfNeeded(["segments"], action);
             runTasks(["segments"]);
             return;
         }
         if (action === "run-rumors") {
             logUI.info("ui_generate_rumor", { tab_id: appState.tabId || null });
+            reportRetryClickIfNeeded(["rumors"], action);
             runTasks(["rumors"]);
             return;
         }
@@ -5581,6 +5622,52 @@ function syncPromptSettingsDraft(panel) {
     return nextDraft;
 }
 
+function buildSettingsUsageSnapshot(settings = {}) {
+    const provider = String(settings.provider || "modelscope").trim();
+    const providerModels = settings.providerModels && typeof settings.providerModels === "object" ? settings.providerModels : {};
+    return {
+        provider,
+        model: String(providerModels[provider] || settings.model || "").trim(),
+        asrProvider: String(settings.asrProvider || "groq").trim(),
+        groqModel: String(settings.groqModel || "").trim(),
+        siliconFlowAsrModel: String(settings.siliconFlowAsrModel || "").trim(),
+        prefMode: String(settings.prefMode || "").trim(),
+        promptMode: String(settings.promptSettings?.mode || "").trim(),
+        customProtocol: String(settings.customProtocol || "").trim(),
+        hasProviderApiKey: !!String(settings.apiKey || "").trim(),
+        hasGroqApiKey: !!String(settings.groqApiKey || "").trim(),
+        hasSiliconFlowApiKey: !!String(settings.siliconFlowApiKey || "").trim(),
+        hasCustomBaseUrl: !!String(settings.customBaseUrl || "").trim()
+    };
+}
+
+function reportSettingsSavedUsageEvent(settings = {}, saveSource = "manual") {
+    const snapshot = buildSettingsUsageSnapshot(settings);
+    const signature = JSON.stringify(snapshot);
+    if (signature === appState.lastSettingsUsageEventSignature) return;
+    appState.lastSettingsUsageEventSignature = signature;
+    reportUsageEvent({
+        eventName: "settings_saved",
+        featureName: "settings",
+        status: "success",
+        provider: snapshot.provider,
+        model: snapshot.model,
+        metadata: {
+            save_source: saveSource,
+            asr_provider: snapshot.asrProvider,
+            groq_model: snapshot.groqModel,
+            siliconflow_asr_model: snapshot.siliconFlowAsrModel,
+            pref_mode: snapshot.prefMode,
+            prompt_mode: snapshot.promptMode,
+            custom_protocol: snapshot.customProtocol,
+            has_provider_api_key: snapshot.hasProviderApiKey,
+            has_groq_api_key: snapshot.hasGroqApiKey,
+            has_siliconflow_api_key: snapshot.hasSiliconFlowApiKey,
+            has_custom_base_url: snapshot.hasCustomBaseUrl
+        }
+    });
+}
+
 async function saveSettingsFromPanel(isAutoSave = false, options = {}) {
     const panel = panelShadowRoot ? panelShadowRoot.getElementById("page-settings") : null;
     if (!panel) return;
@@ -5698,6 +5785,7 @@ async function saveSettingsFromPanel(isAutoSave = false, options = {}) {
                     if (isAutoSave) {
                         const saveRes = await chrome.runtime.sendMessage({ action: "SAVE_SETTINGS", settings: payload });
                         if (saveRes?.settings) appState.settings = saveRes.settings;
+                        reportSettingsSavedUsageEvent(appState.settings || payload, "autosave");
                         if (statusEl) {
                             statusEl.textContent = "授权后才会启用自定义 API";
                             statusEl.className = "show syncing";
@@ -5716,6 +5804,7 @@ async function saveSettingsFromPanel(isAutoSave = false, options = {}) {
         if (!res?.ok) throw new Error(res?.error || "保存失败");
         appState.settings = res.settings || payload;
         appState.settingsPromptDraft = normalizePromptSettingsState(appState.settings?.promptSettings || payload.promptSettings);
+        reportSettingsSavedUsageEvent(appState.settings || payload, isAutoSave ? "autosave" : "manual");
         
     if (isAutoSave) {
         const livePanel = panel;
@@ -6642,6 +6731,26 @@ function getCurrentVideoTaskErrorView(task) {
     return mapErrorToView(toErrorInput(rawError, "任务失败"), "任务失败", {
         provider: appState.settings?.provider || "",
         surface: "panel"
+    });
+}
+
+function reportRetryClickIfNeeded(tasks = [], action = "") {
+    const taskList = Array.isArray(tasks) ? tasks : [];
+    const failedTask = taskList.find((task) => {
+        if (task === "transcribe") return appState.panelErrors?.CC;
+        return getCurrentVideoTaskErrorView(task);
+    });
+    if (!failedTask) return;
+    const featureName = taskList.includes("summary") && taskList.includes("segments")
+        ? "summary_segments_merged"
+        : failedTask;
+    const errorView = failedTask === "transcribe" ? appState.panelErrors?.CC : getCurrentVideoTaskErrorView(failedTask);
+    reportUsageEvent({
+        eventName: "retry_clicked",
+        featureName,
+        status: "clicked",
+        errorCode: errorView?.code || "",
+        metadata: { action }
     });
 }
 
