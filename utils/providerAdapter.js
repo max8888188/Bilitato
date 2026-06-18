@@ -56,6 +56,14 @@ export const PROVIDERS = {
         tokenPrefix: "Bearer ",
         regUrl: "https://platform.moonshot.cn/console/api-keys"
     },
+    mimo: {
+        name: "小米 MiMo",
+        baseUrl: "https://api.xiaomimimo.com/v1/",
+        model: "mimo-v2.5-pro",
+        headerKey: "api-key",
+        tokenPrefix: "",
+        regUrl: "https://mimo.mi.com/platform"
+    },
     claude: {
         name: "Claude",
         baseUrl: "https://api.anthropic.com",

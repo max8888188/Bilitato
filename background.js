@@ -237,7 +237,20 @@ function formatPlaybackTime(totalSeconds = 0) {
 function shouldCaptureRuntimeMessageError(msg, error) {
     const action = String(msg?.action || "").trim();
     if (action === "RUN_TASKS") return false;
+    if (isBenignAbortError(error)) return false;
     return true;
+}
+
+function isBenignAbortError(error) {
+    const name = String(error?.name || "").trim();
+    const code = String(error?.code || "").trim();
+    const message = String(error?.message || error || "").trim();
+    return (
+        name === "AbortError" ||
+        code === "20" ||
+        code === "ABORT_ERR" ||
+        /signal is aborted without reason|bodystreambuffer was aborted|operation was aborted|the operation was aborted/i.test(message)
+    );
 }
 
 async function getSentryRuntimeContext() {

@@ -179,6 +179,13 @@ function getProviderModelOptions(providerKey) {
             "moonshot-v1-32k",
             "moonshot-v1-128k"
         ],
+        mimo: [
+            "mimo-v2.5-pro",
+            "mimo-v2.5",
+            "mimo-v2-pro",
+            "mimo-v2-omni",
+            "mimo-v2-flash"
+        ],
         claude: [
             "claude-opus-4-5",
             "claude-sonnet-4-6",

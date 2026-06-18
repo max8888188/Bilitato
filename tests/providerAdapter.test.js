@@ -217,6 +217,31 @@ describe("providerAdapter", () => {
     });
   });
 
+  it("builds Xiaomi MiMo OpenAI-compatible requests with api-key auth", async () => {
+    const fetchMock = vi.fn(async () => mockJsonResponse({
+      choices: [{ message: { content: "MiMo 返回" } }],
+      usage: { total_tokens: 11 }
+    }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await callAI("mimo", {
+      provider: "mimo",
+      apiKey: "mimo-key",
+      model: "mimo-v2.5-pro"
+    }, [{ role: "user", content: "总结" }]);
+
+    expect(result.text).toBe("MiMo 返回");
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(url).toBe("https://api.xiaomimimo.com/v1/chat/completions");
+    expect(init.headers["api-key"]).toBe("mimo-key");
+    expect(init.headers.Authorization).toBeUndefined();
+    expect(JSON.parse(init.body)).toMatchObject({
+      model: "mimo-v2.5-pro",
+      messages: [{ role: "user", content: "总结" }],
+      stream: false
+    });
+  });
+
   it("falls back to non-streaming calls for Gemini streaming requests", async () => {
     const fetchMock = vi.fn(async () => mockJsonResponse({
       candidates: [{ content: { parts: [{ text: "一次性返回" }] } }]
