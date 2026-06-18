@@ -43,7 +43,6 @@
             {
               title: "429 / 5XX 改为面板提示",
               desc: "高频限流和服务异常不再只弹 Toast，而是进入面板卡片，并统一补上重试按钮。",
-              highlight: true,
             },
             {
               title: "细化 402 / 429 错误文案",
@@ -659,7 +658,7 @@
   function buildReleasePageVersions(version) {
     const majorHistory = [];
     if (version === "1.4.1") {
-      majorHistory.push("1.4.1", "1.4.0");
+      majorHistory.push("1.4.1", "1.4.0", "1.3.x", "1.2.x");
     } else if (version === "1.4.0") {
       majorHistory.push("1.4.0", "1.3.x", "1.2.x");
     } else if (version === "1.3.1" || version === "1.3.0" || version === "1.3.x") {
